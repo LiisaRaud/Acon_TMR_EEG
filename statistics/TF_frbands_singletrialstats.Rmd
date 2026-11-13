@@ -1,0 +1,1506 @@
+---
+title: "TF_frbands_singletrialstats"
+author: "Liisa Raud"
+date: "2026-02-02"
+output: html_document
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(psych) #correlation matrix visualization
+library(lme4) #mixed regression
+library(lmerTest) #p-values for mixed regression
+library(Rmisc) #to caluclate within-subj CIs
+library(parameters) #standardizes lme parameters
+library(corrplot)
+library(marginaleffects) #effect sizes
+library(effectsize)
+library(reshape2)
+library(RColorBrewer)
+library(ggpubr) #arrange figures
+library(paletteer) #color palettes
+
+
+```
+
+# Output paths
+```{r}
+figpath = 'manuscript_figures/'
+```
+
+# Input data: EEG
+```{r, echo = TRUE}
+main_directory <- ""  
+fname_enc = paste(main_directory, 'encoding_singletrial_TF.csv', sep="")
+fname_sleep = paste(main_directory, 'sleep_singletrial_TF.csv', sep="")
+
+dat_enc_orig <- read.csv(fname_enc)
+dat_sleep_orig <- read.csv(fname_sleep)
+
+#Add trial ID to the data
+dat_enc_orig$trialID <- 1:dim(dat_enc_orig)[1]
+dat_sleep_orig$trialID <- 1:dim(dat_sleep_orig)[1]
+
+#Select baseline method
+bl_method = "db" #db, subtr
+
+#Select pipeline
+pipeline <- "alltrials" #alltrials, delta_mediansplit
+
+```
+
+# Input data: demogaphics
+```{r}
+#Participant list (tmr-log)
+pathin_tmrlog <- ''
+fname_tmrlog <- paste(pathin_tmrlog, 'TMR_log_cleaned_v2.csv', sep="")
+data_tmrlog <- read_delim(fname_tmrlog, delim=",")
+data_tmrlog <- data_tmrlog %>% filter(tmrlog_visitit=="eeg")
+
+#Calculate age
+data_tmrlog$birthdate <- as.Date(data_tmrlog$birthdate)
+data_tmrlog$tmrlog_date <- as.Date(data_tmrlog$tmrlog_date)
+data_tmrlog$age_in_years = as.numeric(difftime(data_tmrlog$tmrlog_date, data_tmrlog$birthdate, units = "days")) / 365.25 #accounts for leap years
+
+#Join participant list with input data
+sublist <- data_tmrlog %>% mutate(subID = paste("sub-", subject_id, sep = "")) %>% 
+  dplyr::select(subID, sex, age_in_years)
+
+dat_enc_orig <- left_join(dat_enc_orig, sublist, by="subID")
+dat_sleep_orig <- left_join(dat_sleep_orig, sublist, by="subID")
+```
+
+# Calculate category-based accuracies
+```{r}
+#Calculate AFC1-accuracy at the category level
+dat_enc_orig <- dat_enc_orig %>% 
+  mutate(correct_category_afc1 = ifelse(((afc_correctresp <= 4 & afc1_givenresp <= 4) | 
+                                           (afc_correctresp > 4 & afc1_givenresp > 4)),
+                                        "correct", "incorrect"
+  )
+  )
+dat_enc_orig$correct_category_afc1 <- as.factor(dat_enc_orig$correct_category_afc1)
+levels(dat_enc_orig$correct_category_afc1)
+#count(dat_enc_orig$correct_category_afc1)
+
+dat_sleep_orig <- dat_sleep_orig %>% 
+  mutate(correct_category_afc1 = ifelse(((afc_correctresp <= 4 & afc1_givenresp <= 4) | 
+                                           (afc_correctresp > 4 & afc1_givenresp > 4)),
+                                        "correct", "incorrect"
+  )
+  )
+dat_sleep_orig$correct_category_afc1 <- as.factor(dat_sleep_orig$correct_category_afc1)
+levels(dat_sleep_orig$correct_category_afc1)
+#count(dat_sleep_orig$correct_category_afc1)
+
+
+#Calculate new variable for AFC1-performance w three levels: category incorrect, cat-correct-item-incorrect, cat-correct-item-correct
+dat_enc_orig <- dat_enc_orig %>% 
+  mutate(pre_performance = case_when(
+    correct_category_afc1 == "incorrect" ~ "cat_incorrect",
+    correct_category_afc1 == "correct" & afc1_accuracy == 0 ~ "cat_correct_item_incorrect",
+    correct_category_afc1 == "correct" & afc1_accuracy == 1 ~ "cat_correct_item_correct"
+  )) 
+dat_enc_orig$pre_performance <- as.factor(dat_enc_orig$pre_performance)
+levels(dat_enc_orig$pre_performance)
+#count(dat_enc_orig$pre_performance)
+
+dat_sleep_orig <- dat_sleep_orig %>% 
+  mutate(pre_performance = case_when(
+    correct_category_afc1 == "incorrect" ~ "cat_incorrect",
+    correct_category_afc1 == "correct" & afc1_accuracy == 0 ~ "cat_correct_item_incorrect",
+    correct_category_afc1 == "correct" & afc1_accuracy == 1 ~ "cat_correct_item_correct"
+  )) 
+dat_sleep_orig$pre_performance <- as.factor(dat_sleep_orig$pre_performance)
+levels(dat_sleep_orig$pre_performance)
+#count(dat_sleep_orig$pre_performance)
+```
+
+# Outliers (participant specific)
+```{r}
+#Select data
+dat_enc_flagged <- dat_enc_orig %>% dplyr::select(subID, itemID, trialID, tmr_cued, tmr_repetitions, condition, vividness,
+                                           age_in_years, sex, 
+                                           afc1_accuracy, afc2_accuracy, afc5_accuracy, retrieval_accuracy,
+                                           pre_performance,
+                                           delta_db, theta_db,
+                                           delta_subtr, theta_subtr,
+                                           delta_plow, theta_plow) %>% 
+  pivot_longer(cols = c(starts_with("delta") | starts_with("theta")),
+               values_to = "power",
+               names_to = c("frequency", "baseline"),
+               names_sep = "_")
+
+dat_sleep_flagged <- dat_sleep_orig %>% dplyr::select(subID, itemID, trialID, learned, repetition, condition, vividness,  
+                                               age_in_years, sex, 
+                                               afc1_accuracy, afc2_accuracy, afc5_accuracy, retrieval_accuracy,
+                                               pre_performance,
+                                               enc_delta_db, enc_theta_db,
+                                               enc_delta_subtr, enc_theta_subtr,
+                                               delta_db, theta_db, lowsigma_db, highsigma_db,
+                                               delta_subtr, theta_subtr, lowsigma_subtr, highsigma_subtr,
+                                               delta_plow, theta_plow, lowsigma_plow, highsigma_plow) %>% 
+  pivot_longer(cols = c(starts_with("delta") | starts_with("theta") | starts_with("lowsigma") | starts_with("highsigma")),
+               values_to = "power",
+               names_to = c("frequency", "baseline"),
+               names_sep = "_")
+
+
+#Log transform baseline power and divisive baseline power to remove "positivity bias"
+dat_enc_flagged$power_tf <- 10*(log10(dat_enc_flagged$power))
+dat_enc_flagged$power_tf[dat_enc_flagged$baseline == "subtr"] <-dat_enc_flagged$power[dat_enc_flagged$baseline == "subtr"] #replace subtractive bl values with the original values (no log-transform)
+
+dat_sleep_flagged$power_tf <- 10*(log10(dat_sleep_flagged$power))
+dat_sleep_flagged$power_tf[dat_sleep_flagged$baseline == "subtr"] <-dat_sleep_flagged$power[dat_sleep_flagged$baseline == "subtr"] #replace subtractive bl values with the original values (no log-transform)
+
+
+#Mark trials based on SD threshold
+sd_thresh = 5
+
+dat_enc_flagged <- dat_enc_flagged %>%
+  group_by(subID, frequency, baseline) %>%
+  mutate(
+    mean_p = mean(power_tf, na.rm = TRUE),
+    sd_p   = sd(power_tf, na.rm = TRUE),
+    z_p    = (power_tf - mean_p) / sd_p,
+    is_outlier = abs(z_p) >= sd_thresh
+  ) %>%
+  ungroup()
+
+dat_sleep_flagged <- dat_sleep_flagged %>%
+  group_by(subID, frequency, baseline) %>%
+  mutate(
+    mean_p = mean(power_tf, na.rm = TRUE),
+    sd_p   = sd(power_tf, na.rm = TRUE),
+    z_p    = (power_tf - mean_p) / sd_p,
+    is_outlier = abs(z_p) >= sd_thresh
+  ) %>%
+  ungroup()
+
+#How many trials removed (in total and by participant
+dat_enc_flagged %>%
+  group_by(frequency, baseline) %>% 
+  dplyr::summarise(
+    total_trials = n(),
+    outliers = sum(is_outlier, na.rm = TRUE),
+    percent_removed = 100 * outliers / total_trials
+  )
+
+dat_enc_flagged %>%
+  group_by(subID, frequency, baseline) %>%
+  dplyr::summarise(
+    n_trials = n(),
+    n_outliers = sum(is_outlier),
+    pct_outliers = 100 * n_outliers / n_trials
+  )
+
+dat_sleep_flagged %>%
+  group_by(frequency, baseline) %>% 
+  dplyr::summarise(
+    total_trials = n(),
+    outliers = sum(is_outlier, na.rm = TRUE),
+    percent_removed = 100 * outliers / total_trials
+  )
+
+dat_sleep_flagged %>%
+  group_by(subID, frequency, baseline) %>%
+  dplyr::summarise(
+    n_trials = n(),
+    n_outliers = sum(is_outlier),
+    pct_outliers = 100 * n_outliers / n_trials
+  )
+
+
+#Revome outliers
+dat_enc_clean <- dat_enc_flagged %>%
+  filter(!is_outlier) %>% 
+  ungroup()
+
+dat_sleep_clean <- dat_sleep_flagged %>%
+  filter(!is_outlier) %>% 
+  ungroup
+
+#Visualization
+dat_enc_flagged %>% ggplot(aes(x=subID, y=z_p, color=is_outlier)) +
+  geom_boxplot() +
+  facet_grid(baseline ~ frequency) +
+  ggtitle("encoding") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) +
+  geom_hline(yintercept = sd_thresh, 
+             linetype = "dashed", 
+             color = "black") +
+    geom_hline(yintercept = -sd_thresh, 
+             linetype = "dashed", 
+             color = "black") +
+  theme_bw()
+
+
+dat_sleep_flagged %>% ggplot(aes(x=subID, y=z_p, color=is_outlier)) +
+  geom_boxplot() +
+  facet_grid(baseline ~ frequency) +
+  ggtitle("sleep") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) +
+  geom_hline(yintercept = sd_thresh, 
+             linetype = "dashed", 
+             color = "black") +
+    geom_hline(yintercept = -sd_thresh, 
+             linetype = "dashed", 
+             color = "black") +
+  theme_bw()
+
+
+```
+
+# Aggregate sleep data over TMR repetitions
+```{r}
+#aggregate by averaing over linear (raw) power values
+dat_sleep_items_clean <- dat_sleep_clean %>% 
+  group_by(subID, itemID, frequency, baseline) %>%
+  dplyr::summarise(
+    power = mean(power, na.rm = TRUE),
+    across(
+      .cols = -c(power, repetition),
+      .fns  = first
+    ),
+    .groups = "drop"
+  ) %>% 
+  ungroup()
+
+#10*log10 over values (db only)
+dat_sleep_items_clean$power_tf <- 10*log10(dat_sleep_items_clean$power)
+dat_sleep_items_clean$power_tf[dat_sleep_items_clean$baseline == "subtr"] <-dat_sleep_items_clean$power[dat_sleep_items_clean$baseline == "subtr"] 
+```
+
+# Continue working with z-scored values for subtractive baseline due to large difference in absolute values
+```{r}
+if (bl_method == "subtr"){
+dat_enc_clean <- dat_enc_clean %>% 
+  group_by(frequency, baseline) %>%  
+  mutate(power_tf = scale(power_tf)) %>% 
+  ungroup()
+
+dat_sleep_clean <- dat_sleep_clean %>% 
+  group_by(frequency, baseline) %>%  
+  mutate(power_tf = scale(power_tf)) %>% 
+  ungroup()
+
+dat_sleep_items_clean <- dat_sleep_items_clean %>% 
+  group_by(frequency, baseline) %>%  
+  mutate(power_tf = scale(power_tf)) %>% 
+  ungroup()
+}
+```
+
+# Select baseline for further analysis
+```{r}
+dat_enc <- dat_enc_clean %>% filter(baseline == bl_method) %>% ungroup()
+dat_sleep <- dat_sleep_clean %>%  filter(baseline == bl_method) %>% ungroup()
+dat_sleep_items <- dat_sleep_items_clean %>%  filter(baseline == bl_method) %>% ungroup()
+```
+
+# Data into wide format
+```{r}
+
+dat_enc <- dat_enc %>% 
+  pivot_wider(
+    id_cols = c(1:14),
+    names_from = frequency,
+    values_from = power_tf
+  )
+
+dat_sleep <- dat_sleep %>% 
+  pivot_wider(
+    id_cols = c(1:18),
+    names_from = frequency,
+    values_from = power_tf
+  )
+
+dat_sleep_items <- dat_sleep_items %>%
+  pivot_wider(
+    id_cols = c(1:3, 5:19),
+    names_from = frequency,
+    values_from = power_tf
+  )
+```
+
+# Scale/log10 encoding values in sleep data
+```{r}
+
+if (bl_method == "db") { 
+  dat_sleep <- dat_sleep %>% 
+    ungroup() %>% 
+    mutate(enc_theta = 10*log10(enc_theta_db),
+           enc_delta = 10*log10(enc_delta_db)
+           ) 
+  
+  dat_sleep_items <- dat_sleep_items %>% 
+    ungroup() %>% 
+    mutate(enc_theta = 10*log10(enc_theta_db),
+           enc_delta = 10*log10(enc_delta_db)
+           )
+} else {
+  dat_sleep <- dat_sleep %>% 
+    ungroup() %>% 
+    mutate(enc_theta = scale(enc_theta_subtr),
+           enc_delta = scale(enc_delta_subtr)) 
+  
+  dat_sleep_items <- dat_sleep_items %>% 
+    ungroup() %>% 
+    mutate(enc_theta = scale(enc_theta_subtr),
+           enc_delta = scale(enc_delta_subtr)) 
+}
+  
+```
+
+# Median split based on delta response (control analysis)
+```{r}
+if (pipeline == "delta_mediansplit") {
+  dat_sleep <- dat_sleep %>% group_by(subID) %>% 
+    filter(learned == 1) %>% 
+    dplyr:: mutate(median_delta = median(delta)) %>% 
+    filter(delta >= median_delta) %>% 
+    ungroup()
+  
+  dat_sleep_items <- dat_sleep_items %>% group_by(subID) %>% 
+    filter(learned == 1) %>% 
+    dplyr:: mutate(median_delta = median(delta)) %>% 
+    filter(delta >= median_delta) %>% 
+    ungroup()
+  
+  #Save data for control-behavioral analysis
+  fname = paste(main_directory, 'sleepitems_TF_highdelta.rds', sep="")
+  save("dat_sleep_items", file=fname)
+}
+```
+
+# Histograms
+```{r}
+#Encoding
+dat_enc %>% pivot_longer(cols = c(delta, theta), names_to = "frequency", values_to = "power") %>% 
+  ggplot(aes(power)) +
+  geom_histogram(binwidth = 0.5) +
+  facet_grid(~ frequency)
+
+
+#Sleep - single trials
+dat_sleep %>% pivot_longer(cols = c(delta, theta, lowsigma, highsigma), names_to = "frequency", values_to = "power") %>% 
+  ggplot(aes(power)) +
+  geom_histogram(binwidth = 0.5) +
+  facet_grid(~ frequency)
+
+
+#Sleep - items
+dat_sleep_items %>% pivot_longer(cols = c(delta, theta, lowsigma, highsigma), names_to = "frequency", values_to = "power") %>% 
+  ggplot(aes(power)) +
+  geom_histogram(binwidth = 0.5) +
+  facet_grid(~ frequency)
+
+```
+
+# Correlations on z-scored (within-person) variables to remove individual differences
+
+```{r}
+
+#Encoding
+dat_enc <- dat_enc %>% group_by(subID) %>% 
+  mutate(scaled_delta = scale(delta),
+         scaled_theta = scale(theta)) %>% 
+  ungroup()
+
+r_enc <- psych::corr.test((dat_enc %>% select(scaled_delta, scaled_theta)))
+#corrplot(r_enc$r,
+#         method = "color",
+#         type = "lower",
+#         tl.col = "black",
+#         addCoef.col = "black")
+
+
+
+#Sleep (single trial)
+dat_sleep <- dat_sleep %>% group_by(subID) %>% 
+  #filter(learned == 1) %>% 
+  mutate(scaled_delta = scale(delta),
+         scaled_theta = scale(theta),
+         scaled_lowsigma = scale(lowsigma),
+         scaled_highsigma = scale(highsigma)) %>% 
+  ungroup()
+
+r_sleep <- psych::corr.test((dat_sleep %>% select(starts_with("scaled"))))
+#corrplot(r_sleep$r,
+#         method = "color",
+#         type = "lower",
+#         tl.col = "black",
+#         addCoef.col = "black")
+
+#Sleep (items)
+dat_sleep_items <- dat_sleep_items %>% 
+  #filter(learned==1) %>% 
+  group_by(subID) %>% 
+  mutate(scaled_enc_delta = scale(enc_delta),
+         scaled_enc_theta = scale(enc_theta),
+         scaled_delta = scale(delta),
+         scaled_theta = scale(theta),
+         scaled_lowsigma = scale(lowsigma),
+         scaled_highsigma = scale(highsigma)) %>% 
+  ungroup()
+
+r_sleep_items <- psych::corr.test((dat_sleep_items %>% select(starts_with("scaled"))))
+#corrplot(r_sleep_items$r,
+#         method = "color",
+#         type = "lower",
+#         tl.col = "black",
+#         addCoef.col = "black")
+
+
+
+```
+
+# Correlations per participant (implemented by Claude, so double-check if deciding to publish)
+```{r}
+res <- dat_sleep_items %>%
+  pivot_longer(c(enc_delta, enc_theta), names_to = "x_var", values_to = "x") %>%
+  pivot_longer(c(delta, theta, lowsigma, highsigma), names_to = "y_var", values_to = "y") %>%
+  group_by(subID, x_var, y_var) %>%
+  dplyr::summarise(
+    r  = cor.test(x, y)$estimate,
+    lo = cor.test(x, y)$conf.int[1],
+    hi = cor.test(x, y)$conf.int[2],
+    p  = cor.test(x, y)$p.value,
+    n  = sum(!is.na(x) & !is.na(y)),
+    .groups = "drop"
+  )
+ 
+p_indcorrs <- res %>%
+  mutate(sig = case_when(lo > 0 ~ "positive",
+                         hi < 0 ~ "negative",
+                         TRUE   ~ "n.s."),
+         sig = factor(sig, levels = c("positive", "n.s.", "negative"))) %>%
+  group_by(x_var, y_var) %>%
+  mutate(pair = paste0(x_var, " vs. ", y_var, "\n",
+                       "pos: ",  round(100 * mean(sig == "positive")), "%   ",
+                       "n.s.: ", round(100 * mean(sig == "n.s.")),     "%   ",
+                       "neg: ",  round(100 * mean(sig == "negative")), "%")) %>%
+  ungroup() %>%
+  mutate(sub_pair = reorder(paste(pair, subID, sep = "__"), -r)) %>%
+  ggplot(aes(x = sub_pair, y = r, fill = sig)) +
+  geom_col() +
+  geom_errorbar(aes(ymin = lo, ymax = hi), width = 0.3) +
+  geom_hline(yintercept = 0) +
+  facet_wrap(~ pair, nrow = 2, scales = "free_x") +
+  scale_fill_manual(values = c("positive" = "firebrick",
+                               "n.s."     = "grey75",
+                               "negative" = "steelblue")) +
+  labs(x = "Participant", y = "r", fill = NULL) +
+  theme_classic() +
+  theme(axis.text.x  = element_blank(),
+        axis.ticks.x = element_blank())
+p_indcorrs
+
+#That's a heterogeneity test, as in meta-analysis (Cochran's Q). Each participant's r is Fisher-z #transformed and weighted by n − 3. Q measures how much the z values spread around the weighted mean, and #without true differences it follows a χ² distribution with k − 1 degrees of freedom.
+res %>%
+  group_by(x_var, y_var) %>%
+  dplyr::summarise(Q  = sum((n - 3) * (atanh(r) - weighted.mean(atanh(r), n - 3))^2),
+            df = n() - 1,
+            p  = pchisq(Q, df, lower.tail = FALSE),
+            .groups = "drop") %>%
+  mutate(p_holm = p.adjust(p, method = "holm"))
+```
+
+
+# Visualization of correlation plots (incl. group correlations)
+```{r}
+#Items
+pretty_names <- c(scaled_enc_delta = "enc-delta", 
+                  scaled_enc_theta = "enc-theta",
+                  scaled_delta = "sleep-delta", 
+                  scaled_theta = "sleep-theta",
+                  scaled_lowsigma = "sleep-low-sigma",
+                  scaled_highsigma = "sleep-high-sigma")
+
+cormat_items <- r_sleep_items$r
+dimnames(cormat_items) <- list(pretty_names[rownames(cormat_items)], pretty_names[colnames(cormat_items)])
+
+
+pal <- paletteer_d("lisa::PabloPicasso_1")
+cormat_items[lower.tri(cormat_items)] <- NA  
+long <- melt(cormat_items, na.rm = TRUE)                      # M with upper triangle set to NA
+item_cor <- ggplot(long, aes(Var1, Var2, fill = value)) +
+  geom_tile() +
+  geom_text(aes(label = sprintf("%.2f", value)), size = 10/.pt) +
+  scale_fill_gradient2(name = "Pearson's r",
+                       low  = pal[2],  # red end
+                       mid  = "white",
+                       high = pal[1],            # blue end
+                       midpoint = 0,
+                       limits = c(-1, 1)) +
+  coord_fixed() +
+  ggtitle("Item associations (n=4741)") +
+  theme_minimal(base_size = 10) +
+  labs(x = NULL, y = NULL) +                               # removes "Var1"/"Var2"
+  theme(panel.grid = element_blank(),                      # all gridlines gone
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
+item_cor
+
+#Single trials
+pretty_names <- c(scaled_delta = "sleep-delta", 
+                  scaled_theta = "sleep-theta",
+                  scaled_lowsigma = "sleep-low-sigma",
+                  scaled_highsigma = "sleep-high-sigma")
+
+cormat_trials <- r_sleep$r
+dimnames(cormat_trials) <- list(pretty_names[rownames(cormat_trials)],pretty_names[colnames(cormat_trials)])
+
+
+cormat_trials[lower.tri(cormat_trials)] <- NA  
+long <- melt(cormat_trials, na.rm = TRUE)                      # M with upper triangle set to NA
+trial_cor <- ggplot(long, aes(Var1, Var2, fill = value)) +
+  geom_tile() +
+  geom_text(aes(label = sprintf("%.2f", value)), size = 10/.pt) +
+  scale_fill_gradient2(name = "Pearson's r",
+                       low  = pal[2],  # red end
+                       mid  = "white",
+                       high = pal[1],            # blue end
+                       midpoint = 0,
+                       limits = c(-1, 1)) +  
+  coord_fixed() +
+  ggtitle("Trial associations (n=47'557)") +
+  theme_minimal(base_size = 10) +
+  labs(x = NULL, y = NULL) +                               # removes "Var1"/"Var2"
+  theme(panel.grid = element_blank(),                      # all gridlines gone
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
+trial_cor
+
+#Group correlations
+group_cor <- readRDS(paste(figpath, "group_corrplot.rds", sep = ""))
+group_cor <- group_cor +
+  scale_fill_gradient2(name = "Pearson's r",
+                       low  = pal[2],  # red end
+                       mid  = "white",
+                       high = pal[1],            # blue end
+                       midpoint = 0,
+                       limits = c(-1, 1))
+group_cor
+
+#assembel and save figure
+fig_corr <- ggarrange(item_cor, group_cor,
+          nrow = 1, ncol = 2,
+          common.legend = TRUE)
+
+
+#ggsave(filename = "fig_correlations.pdf", 
+#       path = figpath,
+#       plot = fig_corr, 
+#       width = 20, 
+#       height = 10, 
+#       units = "cm")
+
+```
+
+
+# Factorize variables and set contrasts
+```{r}
+#Factorizing: encoding
+dat_enc$subID <- as.factor(dat_enc$subID)
+dat_enc$trialID <- as.factor(dat_enc$trialID)
+dat_enc$itemID <- as.factor(dat_enc$itemID)
+dat_enc$sex <- as.factor(dat_enc$sex)
+dat_enc$tmr_cued <- as.factor(dat_enc$tmr_cued)
+dat_enc$condition <- as.factor(dat_enc$condition)
+dat_enc$pre_performance <- as.factor(dat_enc$pre_performance)
+
+contrasts(dat_enc$sex) <- c(-0.5, 0.5)
+contrasts(dat_enc$tmr_cued) <- c(-0.5, 0.5)
+contrasts(dat_enc$condition) <- c(-0.5, 0.5)
+contrasts(dat_enc$pre_performance) <- t(rbind(c(c(1/3, 1/3, -2/3)), #category correct vs incorrect 
+                                            c(0.5, -0.5, 0))) #item correct vs incorrect, 
+
+#Factorizing: sleep
+dat_sleep$subID <- as.factor(dat_sleep$subID)
+dat_sleep$trialID <- as.factor(dat_sleep$trialID)
+dat_sleep$itemID <- as.factor(dat_sleep$itemID)
+dat_sleep$sex <- as.factor(dat_sleep$sex)
+dat_sleep$condition <- as.factor(dat_sleep$condition)
+
+contrasts(dat_sleep$sex) <- c(-0.5, 0.5)
+contrasts(dat_sleep$pre_performance) <- c(-0.5, 0.5)
+
+#Factorizing: items
+dat_sleep_items$subID <- as.factor(dat_sleep_items$subID)
+dat_sleep_items$trialID <- as.factor(dat_sleep_items$trialID)
+dat_sleep_items$itemID <- as.factor(dat_sleep_items$itemID)
+dat_sleep_items$sex <- as.factor(dat_sleep_items$sex)
+dat_sleep_items$condition <- as.factor(dat_sleep_items$condition)
+
+contrasts(dat_sleep_items$sex) <- c(-0.5, 0.5)
+contrasts(dat_sleep_items$pre_performance) <- c(-0.5, 0.5)
+
+```
+
+
+# Encoding : learned vs forgotten
+```{r}
+#Long format to include memory testing timepoints
+dat_enc_long <- dat_enc %>% 
+  pivot_longer(cols = c(afc1_accuracy, afc2_accuracy, afc5_accuracy),
+               names_to = c("timepoint", "afc"),
+               names_sep = "_",
+               values_to = "accuracy")
+
+
+# Factorizing and contrasts
+dat_enc_long$timepoint <- as.factor(dat_enc_long$timepoint)
+contrasts(dat_enc_long$timepoint) <- matrix(
+  c(
+     0.5, -0.5,  0,   # T1 vs T2
+     0,  0.5, -0.5    # T2 vs T3
+  ),
+  ncol = 2
+)
+colnames(contrasts(dat_enc_long$timepoint)) <- c("AFC1_vs_AFC2", "AFC2_vs_AFC5")
+
+# Fit model: no interactions
+mod_enc_orig <- glmer(accuracy ~ delta + theta + 
+                        timepoint + 
+                        vividness + 
+                        condition +
+                        age_in_years + sex +
+                        (1 | subID/itemID), 
+                      data = dat_enc_long, 
+                      family = binomial, nAGQ = 0L)
+summary(mod_enc_orig)
+
+
+#Fit model: vividness interactions
+mod_enc_vivint <- glmer(accuracy ~ delta + theta + 
+                          timepoint + vividness + 
+                          condition +
+                   delta*vividness + theta*vividness +
+                   age_in_years + sex +
+                   (1 | subID/itemID), 
+               data = dat_enc_long, 
+              family = binomial, nAGQ = 0L)
+summary(mod_enc_vivint)
+
+#Fit model: timepoint interactions
+mod_enc_timeint <- glmer(accuracy ~ delta + theta + 
+                           timepoint + vividness + 
+                           condition +
+                   delta*timepoint + theta*timepoint +
+                   age_in_years + sex +
+                   (1 | subID/itemID), 
+               data = dat_enc_long, 
+              family = binomial, nAGQ = 0L)
+summary(mod_enc_timeint)
+
+
+
+
+cbind(
+  AIC(mod_enc_orig, mod_enc_vivint, mod_enc_timeint),
+  BIC(mod_enc_orig, mod_enc_vivint, mod_enc_timeint))[, c(1, 2, 4)] %>% 
+  mutate(
+    model = rownames(.)
+  )
+
+anova(mod_enc_orig, mod_enc_vivint)
+anova(mod_enc_orig, mod_enc_timeint)
+
+
+```
+
+# Effects of the selected model
+```{r}
+mod_select <- mod_enc_vivint
+summary(mod_select)
+
+#Odd's ratios
+ors <- exp(cbind(OR = fixef(mod_select), confint(mod_select, parm = "beta_", method = "Wald")))
+
+#AMEs for continous variables
+ame_cont <- avg_slopes(mod_select, 
+                       variables = c("delta", "theta", "vividness", "age_in_years"),
+           type = "response", re.form = NA)
+
+#AMEs for categorical variables
+ame_cat <- avg_comparisons(mod_select, 
+                           variables = c("condition", "sex"),
+                           type = "response", re.form = NA)
+
+ame_cat_time1  <- avg_predictions(mod_select, 
+                                  variables = "timepoint", 
+                                  type = "response",
+                                  re.form = NA, hypothesis = "b1 - b2 = 0")
+
+ame_cat_time2 <- avg_predictions(mod_select, 
+                                 variables = "timepoint", 
+                                 type = "response",
+                                re.form = NA, hypothesis = "b2-b3 = 0")
+
+#Interaction (theta + vividness)
+# AME of theta at each level of vividness (interaction effect)
+ame_int_thetaviv <- avg_slopes(
+  mod_select,
+  variables  = "theta",
+  type       = "response",
+  newdata    = datagrid(vividness = 1:4),
+  by        = "vividness"
+)
+
+#Scale theta and theta*interactions with SD for better interpretation
+theta_sd <- sd(dat_enc_long$theta, na.rm = TRUE)
+100 * theta_sd * unlist(ame_cont[ame_cont$term == "theta", c("estimate", "conf.low", "conf.high")])  # AME per SD (pp)
+
+ame_int_thetaviv$estimate_sd <- ame_int_thetaviv$estimate * theta_sd*100
+ame_int_thetaviv$ci_low_sd   <- ame_int_thetaviv$conf.low * theta_sd*100
+ame_int_thetaviv$ci_high_sd  <- ame_int_thetaviv$conf.high * theta_sd*100
+
+print(ame_int_thetaviv)
+
+
+
+#Random effects
+re <- as.data.frame(VarCorr(mod_select))
+re
+
+ngrps(mod_select)
+nobs(mod_select)
+```
+
+
+# Selected model into table
+```{r}
+## ---- 1. Edit these three blocks to match your model ------------------
+
+# Coefficient name (as in summary) -> label in the table
+labels <- c(
+  "(Intercept)"    = "Intercept",
+  "delta" = "delta",
+  "theta" = "theta",
+  "vividness"          = "vividness",
+  "timepointAFC1_vs_AFC2" = "test time (pre-sleep - 12h)",
+  "timepointAFC2_vs_AFC5" = "test time (12h - 5d)",
+  "condition1" = "category",
+  "age_in_years" = "age (years)",
+  "sex1" = "sex",
+  "delta:vividness"  = "delta \u00d7 vividness",
+  "theta:vividness" = "theta \u00d7 vividness"
+)
+
+# Coefficient name -> term name in ame_cont / ame_cat (main effects only)
+ame_map <- c(
+  "delta" = "delta",
+  "theta" = "theta",
+  "vividness"          = "vividness",
+  "age_in_years"    = "age_in_years",
+  "condition1" = "condition",
+  "sex1" = "sex",
+  "timepointAFC1_vs_AFC2" = "test time (pre-sleep - 12h)",
+  "timepointAFC2_vs_AFC5" = "test time (12h - 5h)") 
+
+
+
+# Significant interactions: coefficient name -> simple-effect AMEs and the
+# 'by' variable used to compute them
+int_map <- list(
+  "theta:vividness"  = list(ame = ame_int_thetaviv,  by = "vividness")
+  )
+
+out_file <- "table_mod_eeg_encoding.txt"
+
+## ---- 2. Helpers -----------------------------------------------------
+fmt    <- function(x, d = 2) formatC(x, format = "f", digits = d)
+fmt_ci <- function(lo, hi, d = 2) paste0("[", fmt(lo, d), ", ", fmt(hi, d), "]")
+fmt_p  <- function(p) ifelse(p < .001, "< .001",
+                             sub("^0", "", formatC(p, format = "f", digits = 3)))
+lab    <- function(nm) if (nm %in% names(labels)) labels[[nm]] else nm
+
+## ---- 3. Build the table ---------------------------------------------
+cf <- summary(mod_select)$coefficients
+
+cols <- c("term", "estimate", "conf.low", "conf.high")
+ame_main <- rbind(as.data.frame(ame_cont)[, cols],
+                  as.data.frame(ame_cat)[, cols])
+
+cols <- c("estimate", "conf.low", "conf.high")
+ame_main <- rbind(ame_main,
+  data.frame(term = "test time (pre-sleep - 12h)", as.data.frame(ame_cat_time1)[, cols]),
+  data.frame(term = "test time (12h - 5h)", as.data.frame(ame_cat_time2)[, cols]))
+
+
+out <- paste("Predictor", "OR", "95% CI", "p", "AME (pp)", "95% CI", sep = "\t")
+
+for (nm in rownames(cf)) {
+  # main-effect AME, if this coefficient has one
+  a <- ame_main[ame_main$term %in% ame_map[nm], ]
+  ame_txt <- if (nrow(a) == 1) {
+    c(fmt(100 * a$estimate), fmt_ci(100 * a$conf.low, 100 * a$conf.high))
+  } else c("", "")
+
+  out <- c(out, paste(lab(nm),
+                      fmt(ors[nm, 1]), fmt_ci(ors[nm, 2], ors[nm, 3]),
+                      fmt_p(cf[nm, 4]),
+                      ame_txt[1], ame_txt[2], sep = "\t"))
+
+  # simple-effect AMEs under significant interactions
+  if (nm %in% names(int_map)) {
+    x   <- as.data.frame(int_map[[nm]]$ame)
+    byv <- int_map[[nm]]$by
+    for (i in seq_len(nrow(x))) {
+      out <- c(out, paste(
+        paste0("    ", x$term[i], " at ", byv, " = ", x[[byv]][i]),
+        "", "", "",
+        fmt(100 * x$estimate[i]),
+        fmt_ci(100 * x$conf.low[i], 100 * x$conf.high[i]), sep = "\t"))
+    }
+  }
+}
+
+## ---- 3b. Random effects ----------------------------------------------
+re_labels <- c("itemID:subID" = "Item within participant (intercept)",
+               "subID"        = "Participant (intercept)")
+
+re <- as.data.frame(VarCorr(mod_select))
+ng <- ngrps(mod_select)
+
+out <- c(out, "", "Random effects",
+         paste("Grouping factor", "Variance", "SD", "N groups", sep = "\t"))
+
+for (i in seq_len(nrow(re))) {
+  g <- re$grp[i]
+  out <- c(out, paste(if (g %in% names(re_labels)) re_labels[[g]] else g,
+                      fmt(re$vcov[i], 3), fmt(re$sdcor[i], 3),
+                      format(ng[[g]], big.mark = ","), sep = "\t"))
+}
+
+out <- c(out, paste("N observations",
+                    format(nobs(mod_select), big.mark = ","), sep = "\t"))
+
+## ---- 3c. Model fit ---------------------------------------------------
+var_fix  <- var(as.vector(getME(mod_select, "X") %*% fixef(mod_select)))
+var_rand <- sum(re$vcov)      # random-intercept variances from 3b
+var_res  <- pi^2 / 3          # residual variance, logit link
+tot      <- var_fix + var_rand + var_res
+
+out <- c(out, "", "Model fit",
+         paste("Marginal R\u00b2",    fmt(var_fix / tot, 3), sep = "\t"),
+         paste("Conditional R\u00b2", fmt((var_fix + var_rand) / tot, 3), sep = "\t"))
+
+
+
+## ---- 4. Write -------------------------------------------------------
+con <- file(out_file, open = "w", encoding = "UTF-8")
+writeLines(out, con)
+close(con)
+cat(out, sep = "\n")
+```
+
+
+
+
+```{r}
+
+# Plot AME of theta across vividness levels
+fig_theta_ame <- plot_slopes(
+  mod_enc_vivint,
+  variables = "theta",
+  condition = "vividness",
+  type      = "response"
+) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  labs(
+    x     = "Vividness",
+    y     = "AME of encoding theta (probability)"
+  ) +
+  theme_classic(base_size = 8) 
+fig_theta_ame
+
+# Extract log-odds of theta at each vividness level
+beta_theta    <- fixef(mod_enc_vivint)["theta"]
+beta_interact <- fixef(mod_enc_vivint)["theta:vividness"]
+
+# For each vividness level, the effective beta of theta is:
+# beta_theta + beta_interact * vividness
+vividness_levels <- 1:4
+
+or_by_vividness <- data.frame(
+  vividness = vividness_levels,
+  or_sd     = exp((beta_theta + beta_interact * vividness_levels) * theta_sd)
+)
+
+print(or_by_vividness)
+
+
+#Visualize the actuacl empirical accuracies at theta bins
+tmpdat <-  dat_enc_long %>%
+  filter(timepoint == "afc2") %>% 
+  filter(vividness != "NaN") %>% 
+  mutate(theta_bin = ntile(theta, 3)
+  )
+tmpdat$theta_bin <- factor(tmpdat$theta_bin,
+                           levels = 1:3,
+                           labels = c("low", "medium", "high"))
+
+summary_df <- tmpdat %>%
+  group_by(subID, vividness, theta_bin) %>%
+  dplyr::summarise(mean_acc_sub = mean(accuracy), .groups = "drop") %>%
+  group_by(vividness, theta_bin) %>%
+  dplyr::summarise(
+    mean_accuracy = mean(mean_acc_sub,na.rm = TRUE),
+    se = sd(mean_acc_sub, na.rm=TRUE)/sqrt(n()),
+    .groups = "drop"
+  )
+
+#Order factors:
+#summary_df$theta_bin <- factor(
+#  summary_df$theta_bin,
+#  levels = c("Low", "Medium", "High")
+#)
+summary_df$vividness <- factor(summary_df$vividness) 
+
+#Remove NA
+summary_df <- summary_df %>% filter(!is.na(theta_bin))
+
+#Visualization - theta x, y-line
+blues9 <- brewer.pal(9, "Blues")   # Blues palette has 9 steps max
+my_blues <- blues9[c(3, 5, 7, 9)]            # last 4 (darkest) tones
+
+fig_theta_vivid <- ggplot(summary_df,
+                          aes(x = theta_bin,
+                              y = mean_accuracy,
+                              color = vividness,
+                              group = vividness)) +
+  geom_line(size = 0.5) +
+  geom_point(size = 1) +
+  geom_errorbar(
+    aes(ymin = mean_accuracy - se,
+        ymax = mean_accuracy + se),
+    width = 0.1,
+    size = 0.6) +
+  scale_color_manual(values = my_blues) +
+  scale_y_continuous(
+    limits = c(0.5,1),
+    expand = c(0,0)) +
+  labs(
+    x = "Encoding theta (binned)",
+    y = "Probability correct",
+    color = "Vividness"
+  ) +
+  theme_classic(base_size = 8) +
+  theme(legend.position = "top")
+fig_theta_vivid
+
+
+#Visualization - vividness x, theta-line
+ggplot(summary_df,
+       aes(x = vividness,
+           y = mean_accuracy,
+           color = theta_bin,
+           group = theta_bin)) +
+  geom_line(size = 1) +
+  geom_point(size = 3) +
+  geom_errorbar(
+    aes(ymin = mean_accuracy - se,
+        ymax = mean_accuracy + se),
+    width = .1,
+    size = .6
+  ) +
+  scale_color_brewer(palette = "Dark2") +
+  scale_y_continuous(
+    limits = c(0.5,0.9),
+    #expand = c(0,0)
+  ) +
+  labs(
+    x = "Vividness",
+    y = "Probability correct",
+    color = "Theta power"
+  ) +
+  theme_classic(base_size = 14) +
+  theme(legend.position = "top")
+
+```
+
+
+# Sleep EEG: rememberd vs forgotten (all data, AFC1 as covariate)
+```{r}
+#Long format to include memory testing timepoints
+dat_sleep_items_long <- dat_sleep_items %>% 
+  pivot_longer(cols = c(afc2_accuracy, afc5_accuracy),
+               names_to = c("timepoint", "afc"),
+               names_sep = "_",
+               values_to = "accuracy")
+
+
+#Discard "new" control items
+dat_sleep_items_long <- dat_sleep_items_long %>% filter(learned == 1)
+
+
+#Factorize variables
+dat_sleep_items_long$timepoint <- as.factor(dat_sleep_items_long$timepoint)
+dat_sleep_items_long$pre_performance = as.factor(dat_sleep_items_long$pre_performance)
+
+#dat_sleep_items_long$condition <- droplevels(dat_sleep_items_long$condition)
+#contrasts(dat_sleep_items_long$condition) <- c(-0.5, 0.5)
+
+#Fit model: sleep eeg only
+mod_sleep_eegonly <- glmer(accuracy ~ delta+theta+lowsigma+highsigma +
+                          timepoint +
+                          age_in_years + sex +
+                          (1 | subID/itemID), 
+                        data = dat_sleep_items_long, 
+                        family = binomial, nAGQ = 0L)
+summary(mod_sleep_eegonly)
+
+#Fit model: no interactions
+mod_sleep_orig <- glmer(accuracy ~ enc_theta+enc_delta+delta+theta+lowsigma+highsigma +
+                          vividness + 
+                          timepoint +
+                          pre_performance +
+                          condition +
+                          age_in_years + sex +
+                          (1 | subID/itemID), 
+                        data = dat_sleep_items_long, 
+                        family = binomial, nAGQ = 0L)
+summary(mod_sleep_orig)
+
+#Fit model: with AFC1 interactions
+mod_sleep_afc1int <- glmer(accuracy ~ (enc_theta+enc_delta+delta+theta+lowsigma+highsigma)*pre_performance +
+                             timepoint + 
+                              vividness +
+                              condition +
+                              age_in_years + sex +
+                              (1 | subID/itemID), 
+                            data = dat_sleep_items_long, 
+                            family = binomial, nAGQ = 0L)
+summary(mod_sleep_afc1int)
+
+
+#Fit model: with time-interactions
+mod_sleep_timeint <- glmer(accuracy ~ (enc_theta+enc_delta+delta+theta+lowsigma+highsigma)*timepoint + 
+                              vividness +
+                              pre_performance +
+                              condition +
+                              age_in_years + sex +
+                              (1 | subID/itemID), 
+                            data = dat_sleep_items_long, 
+                            family = binomial, nAGQ = 0L)
+summary(mod_sleep_timeint)
+
+
+#Fit model: with vividness interactions
+mod_sleep_vividint <- glmer(accuracy ~ (enc_theta+enc_delta+delta+theta+lowsigma+highsigma)*vividness + 
+                               timepoint +
+                               pre_performance +
+                               condition +
+                               age_in_years + sex +
+                               (1 | subID/itemID), 
+                             data = dat_sleep_items_long, 
+                             family = binomial, nAGQ = 0L)
+summary(mod_sleep_vividint)
+
+
+```
+
+
+# Directly compare sleep activity between correct/incorrect afc items
+```{r}
+mod_delta <- lmer(delta ~ afc1_accuracy + (1 | subID),
+                  data = dat_sleep_items %>% filter(learned == 1))
+summary(mod_delta)
+
+mod_theta <- lmer(theta ~ afc1_accuracy + (1 | subID),
+                  data = dat_sleep_items %>% filter(learned == 1))
+summary(mod_theta)
+
+mod_lowsigma <- lmer(lowsigma ~ afc1_accuracy + (1 | subID),
+                  data = dat_sleep_items %>% filter(learned == 1))
+summary(mod_lowsigma)
+
+mod_highsigma <- lmer(highsigma ~ afc1_accuracy + (1 | subID),
+                  data = dat_sleep_items %>% filter(learned == 1))
+summary(mod_highsigma)
+
+```
+
+# Sleep EEG: learned vs. new
+## Linear models
+```{r}
+mod_delta <- lmer(delta ~ learned + age_in_years + sex +(1 |subID), data = dat_sleep_items)
+mod_theta <- lmer(theta ~ learned + age_in_years + sex +(1  | subID), data = dat_sleep_items)
+mod_lowsigma <- lmer(lowsigma ~ learned + age_in_years + sex + + (1 | subID), data = dat_sleep_items)
+mod_highsigma  <- lmer(highsigma ~ learned + age_in_years + sex +(1 | subID), data = dat_sleep_items)
+
+summary(mod_delta)
+summary(mod_theta)
+
+summary(mod_lowsigma)
+summary(mod_highsigma)
+```
+
+### Write into a table
+```{r}
+if (pipeline == "alltrials") {
+## ---- 1. Settings (edit these) ---------------------------------------
+# One row per model; names become the "Outcome" column
+models <- list(
+  "Delta"      = mod_delta,
+  "Theta"      = mod_theta,
+  "Low sigma"  = mod_lowsigma,
+  "High sigma" = mod_highsigma
+)
+
+term     <- "learned"   # coefficient name of learned vs. new (see summary())
+grp      <- "subID"      # grouping factor of the random intercept
+out_file <- "table_eeg_sleep_learned.txt"
+
+## ---- 2. Helpers -----------------------------------------------------
+fmt    <- function(x, d = 2) formatC(x, format = "f", digits = d)
+fmt_ci <- function(lo, hi, d = 2) paste0("[", fmt(lo, d), ", ", fmt(hi, d), "]")
+fmt_p  <- function(p) ifelse(p < .001, "< .001",
+                             sub("^0", "", formatC(p, format = "f", digits = 3)))
+
+## ---- 3. Extract everything per model --------------------------------
+res <- lapply(models, function(m) {
+  y_sd <- sd(getME(m, "y"))                       # SD of the outcome
+
+  # Satterthwaite df and p-values if lmerTest is installed, else normal approx.
+  cf <- tryCatch(coef(summary(lmerTest::as_lmerModLmerTest(m))),
+                 error = function(e) NULL)
+  if (!is.null(cf)) {
+    df <- cf[term, "df"]
+    p  <- cf[term, "Pr(>|t|)"]
+  } else {
+    cf <- coef(summary(m))
+    df <- Inf
+    p  <- 2 * pnorm(-abs(cf[term, "t value"]))
+  }
+  b    <- cf[term, "Estimate"]
+  se   <- cf[term, "Std. Error"]
+  crit <- qt(.975, df)
+
+  vc    <- as.data.frame(VarCorr(m))
+  v_sub <- vc$vcov[vc$grp == grp]
+  v_res <- vc$vcov[vc$grp == "Residual"]
+  v_fix <- var(as.vector(getME(m, "X") %*% fixef(m)))
+  tot   <- v_fix + v_sub + v_res
+
+  data.frame(
+    beta   = b / y_sd,                            # standardized difference
+    lo     = (b - crit * se) / y_sd,
+    hi     = (b + crit * se) / y_sd,
+    p      = p,
+    sd_sub = sqrt(v_sub) / y_sd,                  # in outcome-SD units
+    sd_res = sqrt(v_res) / y_sd,
+    icc    = v_sub / (v_sub + v_res),
+    r2m    = v_fix / tot,
+    r2c    = (v_fix + v_sub) / tot,
+    n_obs  = nobs(m),
+    n_grp  = ngrps(m)[[grp]],
+    satt   = is.finite(df)
+  )
+})
+res <- do.call(rbind, res)
+res$p_holm <- p.adjust(res$p, method = "holm")    # correction across the models
+
+## ---- 4. Build the table ---------------------------------------------
+out <- paste("Outcome", "\u03b2", "95% CI", "p", "p (Holm)",
+             "SD (participant)", "SD (residual)", "Conditional R\u00b2", sep = "\t")
+
+for (i in seq_len(nrow(res))) {
+  r <- res[i, ]
+  out <- c(out, paste(rownames(res)[i],
+                      fmt(r$beta), fmt_ci(r$lo, r$hi),
+                      fmt_p(r$p), fmt_p(r$p_holm),
+                      fmt(r$sd_sub), fmt(r$sd_res), 
+                      fmt(r$r2c, 3), sep = "\t"))
+}
+
+## ---- 5. Note --------------------------------------------------------
+n_txt <- function(x) if (length(unique(x)) == 1) format(x[1], big.mark = ",") else
+  paste0(format(min(x), big.mark = ","), "\u2013", format(max(x), big.mark = ","))
+
+note <- paste0(
+  "Note. Separate linear mixed models were fitted for each EEG feature ",
+  "(feature ~ learned + (1 | ", grp, ")) with lme4. Learned vs. new items were ",
+  "contrast-coded (\u22120.5, 0.5). \u03b2 = difference between learned and new items ",
+  "in standard deviations of the respective EEG feature, with 95% confidence interval",
+  if (all(res$satt)) " and p-values based on Satterthwaite degrees of freedom (lmerTest). "
+  else " and p-values based on the normal approximation. ",
+  "p (Holm) = p-values corrected for multiple comparisons across the ", nrow(res),
+  " models (Holm, 1979). Random-effect SDs are expressed in standard deviations of ",
+  "the respective feature. ICC = proportion of the residual variance (not explained ",
+  "by the fixed effect) attributable to participants. Marginal and conditional R\u00b2 ",
+  "after Nakagawa & Schielzeth (2013). N = ", n_txt(res$n_obs), " observations from ",
+  n_txt(res$n_grp), " participants per model."
+)
+out <- c(out, "", note)
+
+## ---- 6. Write -------------------------------------------------------
+con <- file(out_file, open = "w", encoding = "UTF-8")
+writeLines(out, con)
+close(con)
+cat(out, sep = "\n")
+}
+```
+
+
+## Logistic regression
+```{r}
+if (pipeline == "alltrials") {
+  #Fit model: without interactions
+  mod_sleep_learned_orig <- glmer(learned ~ delta + theta  + lowsigma + highsigma + 
+                                    age_in_years + sex +
+                                    (1 | subID),
+                                  data = dat_sleep_items, 
+                                  family = binomial, nAGQ = 0L)
+  summary(mod_sleep_learned_orig)
+  standardise_parameters(mod_sleep_learned_orig)
+  
+  
+  #Fit model: with EEG interactions
+  mod_sleep_learned_EEGint <- glmer(learned ~ delta + theta  + lowsigma + highsigma + 
+                                      delta*theta +  delta*lowsigma + delta*highsigma +
+                                      theta*lowsigma + theta*highsigma +
+                                      lowsigma*highsigma +
+                                      age_in_years + sex +
+                                      (1 | subID),
+                                    data = dat_sleep_items, 
+                                    family = binomial, nAGQ = 0L)
+  summary(mod_sleep_learned_EEGint)
+  standardise_parameters(mod_sleep_learned_EEGint)
+  
+  
+  # Compare models
+  cbind(
+    AIC(mod_sleep_learned_orig, mod_sleep_learned_EEGint),
+    BIC(mod_sleep_learned_orig, mod_sleep_learned_EEGint))[, c(1, 2, 4)] %>% 
+    mutate(
+      model = rownames(.)
+    )
+  anova(mod_sleep_learned_orig, mod_sleep_learned_EEGint)
+}
+```
+
+
+# Effects of the selected model
+```{r}
+if (pipeline == "alltrials") {
+mod_select <- mod_sleep_learned_orig
+summary(mod_select)
+
+#Odd's ratios
+ors <- exp(cbind(OR = fixef(mod_select), confint(mod_select, parm = "beta_", method = "Wald")))
+
+#AMEs for continous variables
+ame_cont <- avg_slopes(mod_select, 
+                       variables = c("delta", "theta", "lowsigma", "highsigma", "age_in_years"),
+           type = "response", re.form = NA)
+
+#AMEs for categorical variables
+ame_cat <- avg_comparisons(mod_select, 
+                           variables = c("sex"),
+                           type = "response", re.form = NA)
+
+
+
+
+
+#Scale delta and theta*interactions with SD for better interpretation
+delta_sd <- sd(dat_sleep_items$delta, na.rm = TRUE)
+100 * delta_sd * unlist(ame_cont[ame_cont$term == "delta", c("estimate", "conf.low", "conf.high")])  # AME per SD (pp)
+
+
+#Random effects
+re <- as.data.frame(VarCorr(mod_select))
+re
+
+isSingular(mod_select)                                  # TRUE = boundary fit
+table(table(dat_sleep_items$subID))                          # how many observations per participant
+summary(tapply(dat_sleep_items$learned, dat_sleep_items$subID, mean))   # spread of per-participant accuracy
+
+mod_check <- update(mod_select, nAGQ = 1, control = glmerControl(optimizer = "bobyqa"))
+VarCorr(mod_check)     
+
+p_sub <- tapply(dat_sleep_items$learned, dat_sleep_items$subID, mean)
+sd(p_sub)                                    # observed spread between participants
+p <- mean(dat_sleep_items$learned)
+sqrt(p * (1 - p) / 96)                       # spread expected from binomial noise alone
+
+
+ngrps(mod_select)
+nobs(mod_select)
+}
+```
+
+# Visualization
+```{r}
+if (pipeline == "alltrials") {
+
+
+#Visualization
+pal <- paletteer_d("lisa::PabloPicasso_1")
+
+dat_sleep_items_long_tmp <- dat_sleep_items %>% 
+  pivot_longer(cols = c(delta, theta, lowsigma, highsigma),
+               values_to = "power",
+               names_to = "frequency")
+
+learned_new_means <- summarySEwithin(
+  data = dat_sleep_items_long_tmp,
+  measurevar = "power",
+  withinvars = c("learned", "frequency"),
+  idvar = "subID",
+  na.rm = TRUE)
+
+learned_new_means$learned <- factor(learned_new_means$learned,
+                           levels = 0:1,
+                           labels = c("new", "learned"))
+
+fig_delta <- learned_new_means %>% ggplot(aes(x=learned, y = power, group = frequency, color = frequency)) +
+  geom_line(size = 0.5) +
+  geom_point(size = 1) +
+
+  geom_errorbar(
+    aes(ymin = power - se,
+        ymax = power + se),
+    width = 0.1,
+    size = 0.6) +
+  labs(
+    y = "Power (db)"
+  ) +
+    scale_color_manual(values = pal[1:4]) +
+  theme_classic(base_size = 8) +
+  theme(legend.position = "right",
+        axis.title.x = element_blank())
+fig_delta
+}
+```
+
+# EEG-vividness associations
+
+```{r}
+if (pipeline == "alltrials") {
+
+mod_viv <- lmer(vividness ~ delta+theta +
+                  age_in_years + sex +
+                  (1 | subID),
+                data = dat_enc)
+summary(mod_viv)
+eta_squared(mod_viv, partial=TRUE)
+
+
+#Visualization
+dat_enc_long_tmp <- dat_enc %>% pivot_longer(cols = c(delta, theta),
+               values_to = "power",
+               names_to = "frequency")
+
+viv_means <- dat_enc_long_tmp %>% 
+  group_by(subID, vividness, frequency) %>% 
+  dplyr::summarise(m_power = mean(power)) %>% 
+  ungroup()
+ 
+viv_means <- summarySEwithin(
+  data = viv_means,
+  measurevar = "m_power",
+  withinvars = c("vividness", "frequency"),
+  idvar = "subID",
+  na.rm = TRUE
+) %>%  filter(vividness != "NaN")
+
+
+fig_viv_encoding <- viv_means %>% ggplot(aes(x=vividness, y = m_power, group = frequency, color = frequency)) +
+  geom_line(size = 0.5) +
+  geom_point(size = 1) +
+
+  geom_errorbar(
+    aes(ymin = m_power - se,
+        ymax = m_power + se),
+    width = 0.1,
+    size = 0.6) +
+  labs(
+    x = "Vividness",
+    y = "Power (db)",
+    title = "Encoding"
+  ) +
+  scale_color_manual(values = pal[1:2]) +
+  theme_classic(base_size = 8) +
+  theme(legend.position = "top")
+fig_viv_encoding  
+
+#Sleep
+mod_viv_sleep <- lmer(power ~ vividness * frequency + age_in_years + sex + (1 | subID/itemID),
+                 data = dat_sleep_items_long_tmp)
+summary(mod_viv_sleep)
+
+
+viv_means_sleep <- dat_sleep_items_long_tmp %>% 
+  group_by(subID, vividness, frequency) %>% 
+  dplyr::summarise(m_power = mean(power)) %>% 
+  ungroup()
+
+viv_means_sleep <- summarySEwithin(
+  data = viv_means_sleep,
+  measurevar = "m_power",
+  withinvars = c("vividness", "frequency"),
+  idvar = "subID",
+  na.rm = TRUE
+) %>%  filter(vividness != "NaN")
+
+
+fig_viv_sleep <- viv_means_sleep %>% ggplot(aes(x=vividness, y = m_power, group = frequency, color = frequency)) +
+  geom_line(size = 0.5) +
+  geom_point(size = 1) +
+
+  geom_errorbar(
+    aes(ymin = m_power - se,
+        ymax = m_power + se),
+    width = 0.1,
+    size = 0.6) +
+  labs(
+    x = "Vividness",
+    y = "Power (db)",
+    title = "Sleep"
+  ) +
+  scale_color_manual(values = pal[1:4]) +
+  theme_classic(base_size = 8) +
+  theme(legend.position = "top")
+fig_viv_sleep
+
+}
+```
+
+
+
+# Manuscript figures
+```{r}
+if (pipeline == "alltrials") {
+
+fig_st_power <- ggarrange(fig_theta_ame,
+          fig_theta_vivid,
+          fig_delta,
+          nrow = 1,
+          ncol = 3)
+fig_st_power
+
+ggsave(filename = "fig_TFpower.pdf", 
+       path = figpath,
+       plot = fig_st_power, 
+       width = 15, 
+       height = 5, 
+       units = "cm")
+}
+```
+
+```{r}
+if (pipeline == "alltrials") {
+
+fig_viv <- ggarrange(fig_viv_encoding,
+                     fig_viv_sleep,
+                     nrow = 1,
+                     ncol = 2)
+
+fig_viv
+}
+```
+

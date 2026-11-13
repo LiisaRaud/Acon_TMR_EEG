@@ -1,0 +1,168 @@
+---
+title: "TMR01_PowerAnalysisB_PowerSimulations_Jan21"
+author: "Liisa Raud"
+date: "1/18/2021"
+output: html_document
+---
+
+
+## Packages  
+```{r message = FALSE, warning=FALSE, echo = TRUE}
+library(tidyverse)
+library(simr)
+library(pwr)
+```
+
+## Power for t-test
+```{r}
+ttest_power = pwr.t.test(n = seq(10, 150, by=10), d = 0.25, sig.level = 0.05, type="paired", alternative = "greater")
+
+ttest_power_tbl = tibble(n=ttest_power$n,
+                         power = ttest_power$power)
+
+ttest_power_tbl %>% ggplot(aes(x=n, y = power)) +
+  geom_point() +
+  geom_line() +
+  geom_hline(yintercept = 0.8) +
+  ggtitle("Paired t-test")
+
+```
+## Data wrangling
+Prepare data from Acon1 for two diffrent power analyses:  
+1) sleep data only (about 90 items per participant)  
+2) two visits per participant (about 180 per participant)
+
+```{r}
+#Load Acon1 data
+load(file = "Acon1_forTMR01power_Jan21.Rda")
+
+#Extract participant IDs
+subID = unique(newRetrData$CrossProject_ID)
+
+#Ideal nr of items to be cued, based on afc performance
+n_items_wished = c(38, 26) #correct, incorrect
+
+
+#For each participant, assign cued variable, so that half of the trials will be cued and other half will be not cued
+newRetrData$cued = matrix(NA, nrow =dim(newRetrData)[1], ncol = 1)
+newRetrData2 = newRetrData[FALSE,]
+for (v in c(1, 2)) { #visit   
+  for (i in unique(newRetrData$CrossProject_ID)) {
+    tmpdata  = newRetrData %>% filter(newRetrData$CrossProject_ID == i & newRetrData$visit == v)
+    
+    if (dim(tmpdata)[1] != 0) {
+      #Calculate whether wished nr of correct/incorrect AFC trials are available and modify accordingly
+      n_items_available = c(sum((tmpdata$AFCaccuracy == TRUE)), sum((tmpdata$AFCaccuracy == FALSE)))
+      
+      if(all(n_items_available - n_items_wished >= 0)){
+        n_items_available = n_items_wished
+      } else if (n_items_available[1] - n_items_wished[1] < 0) {
+        n_items_available = c(n_items_available[1], n_items_wished[2] + (n_items_wished[1] - n_items_available[1]))
+      } else if (n_items_available[2] - n_items_wished[2] < 0) {
+        n_items_available = c(n_items_wished[1] + (n_items_wished[2] - n_items_available[2]), n_items_available[2])
+      }
+      
+      #Divide data by afc accuracy
+      tmpafccorrect = tmpdata %>% filter(AFCaccuracy == TRUE)
+      tmpafcincorrect = tmpdata %>% filter(AFCaccuracy == FALSE)
+      
+      #Assigncues
+      tmpafccorrect$cued = sample(c(rep(1, n_items_available[1]), rep(0, dim(tmpafccorrect)[1]-n_items_available[1])))
+      tmpafcincorrect$cued = sample(c(rep(1, n_items_available[2]), rep(0, dim(tmpafcincorrect)[1]-n_items_available[2])) )
+      
+      
+      newRetrData2 = bind_rows(newRetrData2, tmpafccorrect, tmpafcincorrect)
+    }
+  }
+}
+
+#Divide data into two datasets
+retrData_sleep = newRetrData2 %>% filter(consolidation_state == "SLEEP")
+retrData_visit = newRetrData2
+rm("tmpdata", "v", "t", "newRetrData", "newRetrData2", "tmpafccorrect", "tmpafcincorrect", "i")
+
+#Check mean accuracies
+retrData_sleep = retrData_sleep %>% group_by(CrossProject_ID) %>% 
+  mutate(ntrials = length(CrossProject_ID)) %>% 
+  ungroup()
+
+retrData_sleep %>% group_by(CrossProject_ID, cued, AFCaccuracy) %>% 
+  summarize(correctsource = sum(accuracy)/ntrials) %>% 
+  ungroup() %>% group_by(cued, AFCaccuracy) %>% 
+  summarize(correctsource = mean(correctsource, na.rm = TRUE))
+
+#Calculate effect size in log odds-ratio based on Acon data and meta-analysis
+p0 = 0.83
+p1 = 0.86
+logodds = log(p1/(1-p1)) - log(p0/(1-p0))
+
+```
+
+## Power for logistic regression (sleep data only)
+
+```{r}
+#Fit logistic regression model
+retrData_sleep$CrossProject_ID = as.factor(retrData_sleep$CrossProject_ID)
+retrData_sleep$AFCaccuracy = as.factor(retrData_sleep$AFCaccuracy)
+retrData_sleep$cued = as.factor(retrData_sleep$cued)
+
+mod = glmer(accuracy ~ cued + AFCaccuracy + (1|CrossProject_ID), data = retrData_sleep, family = "binomial")
+
+#Set the predicted baseline effect and cue effect size
+mod_sleep = mod
+#fixef(mod_sleep)["(Intercept)"] = log(p0/(1-p0)) 
+fixef(mod_sleep)["cued1"] = logodds 
+
+#Print summary of the dummy-model
+print(summary(mod_sleep))
+
+#Extend sample size for the dummy-model
+mod_sleep_extended = extend(mod_sleep, along = "CrossProject_ID", n = 100)
+
+#Calculate power curve
+powercurve_mod_sleep = powerCurve(mod_sleep_extended, along = "CrossProject_ID",
+                                  test = fixed("cued1"))
+print(powercurve_mod_sleep)
+
+#Visualization of the power curve
+plot(powercurve_mod_sleep)
+
+#Save results for sleep model
+save(retrData_sleep, mod_sleep, mod_sleep_extended, powercurve_mod_sleep, file = "TMR01_ResultsPower_SleepModel.RData")
+
+```
+
+## Power for logistic regression (two visits)
+
+```{r}
+#Fit logistic regression model
+retrData_visit$CrossProject_ID = as.factor(retrData_visit$CrossProject_ID)
+retrData_visit$visit = as.factor(retrData_visit$visit)
+retrData_visit$AFCaccuracy = as.factor(retrData_visit$AFCaccuracy)
+retrData_visit$cued = as.factor(retrData_visit$cued)
+
+mod2 = glmer(accuracy ~ cued + AFCaccuracy + visit + (1|CrossProject_ID), data = retrData_visit, family = "binomial")
+
+#Set the predicted baseline effect and cue effect size
+mod_visit = mod2
+#fixef(mod_visit)["(Intercept)"] = log(p0/(1-p0)) 
+fixef(mod_visit)["cued1"] = logodds
+
+#Print summary of the dummy-model
+print(summary(mod_visit))
+
+#Extend sample size for the dummy-model
+mod_visit_extended = extend(mod_visit, along = "CrossProject_ID", n = 100)
+
+#Calculate power curve
+powercurve_mod_visit = powerCurve(mod_visit_extended, along = "CrossProject_ID", test = fixed("cued1"))
+print(powercurve_mod_visit)
+
+#Visualization of the power curve
+plot(powercurve_mod_visit)
+
+#Save results for the visit model
+save(retrData_visit, mod_visit, mod_visit_extended, powercurve_mod_visit, file = "TMR01_ResultsPower_VisitModel.RData")
+```
+
+

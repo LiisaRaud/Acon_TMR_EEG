@@ -1,0 +1,175 @@
+---
+title: "TMR01_SleepArchitecture"
+author: "Liisa Raud"
+date: "2025-08-11"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(gtsummary) #summarytables
+library(ggpubr) #combining figures
+
+```
+
+# Input data
+```{r, echo = TRUE}
+main_directory <- ""  
+
+#Summary sleep statistics (architecture)
+fname_sleepstats <- paste(main_directory, 'sleepstatistics_allsubs_acq_eeg.csv', sep="")
+dat_archit <- read.csv(fname_sleepstats)
+
+#Collect TMR logfiles
+BEH_directory <- ""
+all_files <- list.files(BEH_directory, pattern = NULL, full.names = TRUE, recursive = TRUE)
+
+# Filter files that contain both "task-sleep" and "sleepstages.csv"
+filtered_files <- all_files[grepl("task-sleep", all_files) & grepl("sleepstages.csv", all_files)]
+
+```
+
+# Combine participant data for TMR logs
+```{r}
+# Loop over individual files
+combined_logs <- data.frame()
+for (file in filtered_files) {
+  # Read the CSV file, assuming it has a header
+  data <- read.csv(file)
+  
+  # Extract 'subid' from the filename; adjust the extraction logic as needed
+  subid <- unlist(strsplit(file, "/"))[12] 
+
+  # Add a column for 'subid' and set it to the extracted 'subid'
+  data$subid <- subid
+  
+  # Combine the current data with the combined data
+  combined_logs <- rbind(combined_logs, data)
+}
+```
+
+```{r}
+#Exclude participants (no TMR)
+noTMR_ids = c('sub-XXX', 
+            'sub-XXX', 
+            'sub-XXX', 
+            'sub-XXX', 
+            'sub-XXX',
+            'sub-XXX', 
+            'sub-XXX', 
+            'sub-XXX',
+            'sub-XXX',
+            'sub-XXX') #discard only from sleep architecutre, first half of the night not recorded
+
+disc_sub_ind <- which(dat_archit$subid %in% noTMR_ids)
+dat_archit <- dat_archit[-disc_sub_ind,]
+
+disc_sub_ind <- which(combined_logs$subid %in% noTMR_ids)
+combined_logs <- combined_logs[-disc_sub_ind,]
+
+```
+
+# Unit transformations
+```{r}
+dat_archit <- dat_archit %>% 
+  mutate(TST_hours = TST/60,
+         TRT_hours = TRT/60) 
+```
+
+# Group statistics: sleep architecture
+```{r}
+dat_archit %>% select(3:18) %>% 
+  tbl_summary(
+    statistic = list(        # Specify summary statistics for variables
+      all_continuous() ~ "{mean} ({sd})",  # For continuous variables
+      all_categorical() ~ "{n} ({p}%)"      # For categorical variables
+    )
+  )
+#print(summary_table)
+```
+
+# Architecture visualization
+```{r}
+#histogram: total sleep time
+hist_TST <- dat_archit %>% ggplot(aes(x=TST_hours)) +
+  geom_histogram() +
+  xlab("total sleep  time (h)")
+
+#histogram: sleep latency
+hist_SL <- dat_archit %>% ggplot(aes(x=SL)) +
+  geom_histogram() +
+  xlab("sleep latency (min)")
+
+#histogram: swake after sleep onsest
+hist_WASO <- dat_archit %>% ggplot(aes(x=WASO)) +
+  geom_histogram() +
+  xlab("wake after sleep onset (min)")
+
+#histogram: sleep efficiency
+hist_SE <- dat_archit %>% ggplot(aes(x=SE)) +
+  geom_histogram() +
+  xlab("sleep efficency (%)")
+
+ggarrange(hist_TST,
+          hist_SL,
+          hist_WASO,
+          hist_SE)
+
+```
+
+# Single trials per stage
+```{r}
+#Visualize TMR distribution by stage
+combined_logs %>% ggplot(aes(x=sleepstage)) +
+  geom_histogram()
+
+#Summarize 
+combined_logs %>% 
+  group_by(sleepstage) %>% 
+  summarise(n_TMR = n(),
+            perc_TMR = (n_TMR/dim(combined_logs)[1])*100
+            )
+
+```
+ # Sleep stage confidence
+```{r}
+combined_logs <- combined_logs %>% 
+  mutate(hits = ifelse(sleepstage == 2 | sleepstage == 3, "yes", "no"))
+
+#Confidence by hit/miss
+combined_logs %>% 
+  group_by(hits) %>% 
+  summarise(mean_conf = mean(sleepstage_confidence),
+            med_conf = median(sleepstage_confidence),
+            min_conf = min(sleepstage_confidence),
+            max.conf = max(sleepstage_confidence)
+  )
+  
+#Confidence by sleep stage
+combined_logs %>% 
+  group_by(sleepstage) %>% 
+  summarise(mean_conf = mean(sleepstage_confidence),
+            med_conf = median(sleepstage_confidence),
+            min_conf = min(sleepstage_confidence),
+            max.conf = max(sleepstage_confidence)
+  )
+  
+
+#Histograms by sleep stage
+combined_logs %>% 
+  filter(hits == "yes") %>% 
+  ggplot(aes(x=sleepstage_confidence)) +
+  geom_histogram() +
+  facet_grid(~sleepstage)
+
+
+combined_logs %>% 
+  filter(hits == "no") %>% 
+  ggplot(aes(x=sleepstage_confidence)) +
+  geom_histogram() +
+  facet_grid(~sleepstage)
+
+```
+ 
+

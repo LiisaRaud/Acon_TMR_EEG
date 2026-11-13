@@ -1,0 +1,904 @@
+---
+title: "TMR01_BehaviorAnalysis_redo"
+author: "Liisa Raud"
+date: "2026-04-13"
+output: html_document
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(readODS)
+library(gtsummary) #summarytables
+library(effsize) #Cohen's d
+library(lme4) #mixed regression
+library(lmerTest) #p-values for mixed regression
+library(Rmisc) #to caluclate within-subj CIs
+library(paletteer) #color palettes
+library(ggpubr) #arrange figures
+library(marginaleffects) #effect sizes
+library(forcats) #renaming factors for easier interpretability
+library(effectsize)
+```
+
+
+# Output paths
+```{r}
+figpath = 'XXX/manuscript_figures/'
+```
+
+
+# Input data
+```{r, echo = TRUE}
+
+#Select pipeline
+pipeline = 'EEGtrials' #alltrials; EEGtrials; delta_mediansplit
+
+##For ALL trials (regardless of EEG information)
+if (pipeline == 'alltrials' | pipeline == 'delta_mediansplit') {
+  pathIn = "XXX/BEHAV/"
+  fname = "behavior_singletrial_allparticipants.csv"
+  dat_singletrial <- read.csv(paste(pathIn, fname, sep = ""))
+} else {
+  
+  #For trials for which EEG and sleep stage info exists
+  #Filenames
+  #Collect TMR logfiles
+  BEH_directory <- "XXX/BEHAV/"
+  all_files <- list.files(BEH_directory, pattern = NULL, full.names = TRUE, recursive = TRUE)
+  
+  # Filter files that contain both "task-retrieval" and "sleepstages.csv"
+  filtered_files <- all_files[grepl("task-retrieval", all_files) & grepl("sleeptages.csv", all_files)]
+  
+  # Loop over individual files
+  dat_singletrial <- data.frame()
+  for (file in filtered_files) {
+    # Read the CSV file, assuming it has a header
+    data <- read.csv(file)
+    
+    # Extract 'subid' from the filename; adjust the extraction logic as needed
+    subid <- unlist(strsplit(file, "/"))[12] 
+    
+    # Add a column for 'subid' and set it to the extracted 'subid'
+    data$subID <- subid
+    data$acq <- 'acq-eeg'
+    
+    # Combine the current data with the combined data
+    dat_singletrial <- rbind(dat_singletrial, data)
+  }
+}
+
+#Participant list (tmr-log)
+pathin_tmrlog <- 'XXX'
+fname_tmrlog <- paste(pathin_tmrlog, 'TMR_log_cleaned_v2.csv', sep="")
+data_tmrlog <- read_delim(fname_tmrlog, delim=",")
+data_tmrlog <- data_tmrlog %>% filter(tmrlog_visitit=="eeg")
+
+#Calculate age
+data_tmrlog$birthdate <- as.Date(data_tmrlog$birthdate)
+data_tmrlog$tmrlog_date <- as.Date(data_tmrlog$tmrlog_date)
+data_tmrlog$age_in_years = as.numeric(difftime(data_tmrlog$tmrlog_date, data_tmrlog$birthdate, units = "days")) / 365.25 #accounts for leap years
+
+#Join participant list with input data
+sublist <- data_tmrlog %>% mutate(subID = paste("sub-", subject_id, sep = "")) %>% 
+  select(subID, sex, age_in_years)
+dat_singletrial <- left_join(dat_singletrial, sublist, by="subID")
+
+if (pipeline == "delta_mediansplit") {
+  main_directory <- "XXX/d_timefrequency/"    
+  fname <- paste(main_directory, 'sleepitems_TF_highdelta.rds', sep="")
+  load(fname)
+  keepitems <- paste(dat_sleep_items$subID, dat_sleep_items$itemID)
+  dat_singletrial$keepitems <- paste(dat_singletrial$subID, dat_singletrial$itemID)
+  keepitems_logic <- dat_singletrial$keepitems %in% keepitems
+  dat_singletrial <- dat_singletrial %>% filter(tmr_cued == 0 | keepitems_logic)
+}
+
+```
+
+# Number of items
+```{r}
+#Nr of items for each participant and task phase
+if (pipeline == 'alltrials' | pipeline == 'delta_mediansplit') {
+  itemsummary <- dat_singletrial %>% group_by(subID, acq) %>% 
+    dplyr::summarise(n_enc = sum(!is.na(encoding_run)),
+                     n_afc1 = sum(!is.na(afc1_givenresp)),
+                     n_afc2 = sum(!is.na(afc2_givenresp)),
+                     n_afc3 = sum(!is.na(afc5_givenresp)),
+                     n_retr = sum(!is.na(retrieval_run)),
+                     #n_retr = sum(!is.na(run)), (different name in EEG-sleestaged datafile)
+                     n_tmr_cued = sum(tmr_cued == 1),
+                     n_tmr_uncued = sum(tmr_cued == 0 & condition != 3),
+                     n_tmr_cued_afc1_correct = sum(tmr_cued == 1 & afc1_accuracy == 1),
+                     n_tmr_cued_afc1_incorrect = sum(tmr_cued == 1 & afc1_accuracy == 0),
+                     tmr_max_repetitions = max(tmr_repetitions, na.rm = TRUE)
+    )
+} else {
+  itemsummary <- dat_singletrial %>% group_by(subID, acq) %>% 
+    dplyr::summarise(n_enc = sum(!is.na(encoding_run)),
+                     n_afc1 = sum(!is.na(afc1_givenresp)),
+                     n_afc2 = sum(!is.na(afc2_givenresp)),
+                     n_afc3 = sum(!is.na(afc5_givenresp)),
+                     #n_retr = sum(!is.na(retrieval_run)),
+                     n_retr = sum(!is.na(run)), #(different name in EEG-sleestaged datafile)
+                     n_tmr_cued = sum(tmr_cued == 1),
+                     n_tmr_uncued = sum(tmr_cued == 0 & condition != 3),
+                     n_tmr_cued_afc1_correct = sum(tmr_cued == 1 & afc1_accuracy == 1),
+                     n_tmr_cued_afc1_incorrect = sum(tmr_cued == 1 & afc1_accuracy == 0),
+                     tmr_max_repetitions = max(tmr_repetitions, na.rm = TRUE) 
+    )
+}
+  
+
+#Summary table
+itemsummary %>% 
+  ungroup() %>% 
+  dplyr::select(starts_with("n_"), "tmr_max_repetitions") %>% 
+  tbl_summary(
+  type = list(everything() ~ 'continuous2'),
+  statistic = list(all_continuous2() ~ c("{mean} ({sd})",
+                                        "{median} ({p25}, {p75})",
+                                        "{min}, {max}")),
+  missing = "ifany" # don't list missing data separately
+) %>%
+  add_n() %>% # add column with total number of non-missing observations
+  modify_header(label = "**Variable**") %>% # update the column header
+  bold_labels()
+
+
+#List nr of participants at each step
+itemsummary %>% 
+  ungroup() %>% 
+  dplyr::summarize(enc = sum(n_enc == 128),
+            retr = sum(n_retr == 192),
+            afc1 = sum(n_afc1 == 128),
+            afc2 = sum(n_afc2 == 128),
+            afc3 = sum(n_afc3 == 128),
+            tmr = sum(n_tmr_cued == 64, na.rm = TRUE)) #at least 1 repetition
+
+#Nr of participants with minimum required data for behavioral analysis (all encoding and retrieval runs + 1 TMR round)
+itemsummary %>% 
+  ungroup() %>% 
+  dplyr::summarize(enc = sum(n_enc == 128 & n_afc1 == 128 & n_tmr_cued == 64 & n_retr == 192, na.rm = TRUE))
+```
+
+
+# Continue working with acq-EEG and discards participants without full data
+```{r}
+dat_singletrial <- dat_singletrial %>% filter(acq == "acq-eeg")
+itemsummary <- itemsummary %>% filter(acq == "acq-eeg")
+
+if (pipeline != "delta_mediansplit") {
+  discardIDs <- itemsummary$subID[which(itemsummary$n_tmr_cued < 64 | #reduce the nr to 50, since some participants have lower values due to missing EEG, even though all trials were in reality included
+                                          is.na(itemsummary$n_tmr_cued) | 
+                                          itemsummary$n_retr == 0)]
+  
+  itemsummary <- itemsummary[-(which(itemsummary$subID %in% discardIDs)),]
+  dat_singletrial <- dat_singletrial[-(which(dat_singletrial$subID %in% discardIDs)),]
+  print(paste("Discarding participants from EEG: ", discardIDs, sep=""))
+  length(unique(dat_singletrial$subID))
+}
+```
+
+# For EEG-informed analysis, discard items that were presented during not-NREM stage at least once
+```{r}
+if (pipeline == 'EEGtrials') {
+  dat_singletrial <- dat_singletrial %>% 
+    filter(n_notNREM < 1 | is.na(n_notNREM))
+}
+```
+
+
+# Data cleaning
+```{r}
+# Discard all retrieval new items from single-trial data
+dat_singletrial <- dat_singletrial %>% filter(condition != 3)
+
+
+#Replace NaN's with NA-s for R-compatibility
+dat_singletrial <- dat_singletrial %>%
+  mutate(across(where(is.numeric), ~ ifelse(is.nan(.), NA, .)))
+
+#Variables into appropriate data-types
+## outcome variables
+dat_singletrial$afc1_accuracy <- as.numeric(dat_singletrial$afc1_accuracy)
+dat_singletrial$afc2_accuracy <- as.numeric(dat_singletrial$afc2_accuracy)
+dat_singletrial$afc5_accuracy <- as.numeric(dat_singletrial$afc5_accuracy)
+dat_singletrial$retrieval_accuracy <- as.numeric(dat_singletrial$retrieval_accuracy)
+
+
+dat_singletrial$afc1_givenresp <- as.numeric(dat_singletrial$afc1_givenresp)
+#naming typo in the two different data-files (with our without sleep-EEG-stage information)
+if (pipeline == 'alltrials' | pipeline == 'delta_mediansplit') {
+  dat_singletrial$afc_correcresponse <- as.numeric(dat_singletrial$afc_correcresponse)
+} else {
+  dat_singletrial$afc_correcresponse <- as.numeric(dat_singletrial$afc_correctresp)
+}
+
+## TMR: factorize and rename factor levels for better interpretability
+dat_singletrial$tmr_cued <- as.factor(dat_singletrial$tmr_cued)
+dat_singletrial <- dat_singletrial %>%
+  mutate(tmr_cued = fct_recode(factor(tmr_cued),
+    "cued"   = "1",
+    "uncued" = "0"
+  ))
+unique(dat_singletrial$tmr_cued)
+count(dat_singletrial$tmr_cued)
+
+## encoding vivdness
+dat_singletrial$encoding_vividness <- as.numeric(dat_singletrial$encoding_vividness)
+unique(dat_singletrial$encoding_vividness)
+count(dat_singletrial$encoding_vividness)
+
+## covariates
+dat_singletrial$sex <- as.factor(dat_singletrial$sex)
+dat_singletrial$subID <- as.factor(dat_singletrial$subID)
+dat_singletrial$itemID <- as.factor(dat_singletrial$itemID)
+dat_singletrial$condition <- as.factor(dat_singletrial$condition)
+dat_singletrial$conditionID <- as.factor(dat_singletrial$conditionID)
+
+
+#Calculate AFC1-accuracy at the category level
+dat_singletrial <- dat_singletrial %>% 
+  mutate(correct_category_afc1 = ifelse(((afc_correcresponse <= 4 & afc1_givenresp <= 4) | 
+                                           (afc_correcresponse > 4 & afc1_givenresp > 4)),
+                                        "correct", "incorrect"
+  )
+  )
+dat_singletrial$correct_category_afc1 <- as.factor(dat_singletrial$correct_category_afc1)
+levels(dat_singletrial$correct_category_afc1)
+count(dat_singletrial$correct_category_afc1)
+
+
+#Calculate new variable for AFC1-performance w three levels: category incorrect, cat-correct-item-incorrect, cat-correct-item-correct
+dat_singletrial <- dat_singletrial %>% 
+  mutate(pre_performance = case_when(
+    correct_category_afc1 == "incorrect" ~ "cat_incorrect",
+    correct_category_afc1 == "correct" & afc1_accuracy == 0 ~ "cat_correct_item_incorrect",
+    correct_category_afc1 == "correct" & afc1_accuracy == 1 ~ "cat_correct_item_correct"
+  )) 
+dat_singletrial$pre_performance <- as.factor(dat_singletrial$pre_performance)
+levels(dat_singletrial$pre_performance)
+count(dat_singletrial$pre_performance)
+
+
+
+
+
+count(dat_singletrial$afc1_accuracy)
+count(dat_singletrial$afc2_accuracy)
+count(dat_singletrial$afc5_accuracy)
+count(dat_singletrial$retrieval_accuracy)
+
+#Check how the percentages are of cued/uncued items, based on pre-sleep performance
+dat_design <- dat_singletrial %>% 
+  group_by(subID) %>% 
+  dplyr::summarise(
+    n_cued = sum(tmr_cued == "cued"),
+    n_uncued = sum(tmr_cued == "uncued"),
+    n_cued_strong = sum(tmr_cued == "cued"& pre_performance == "cat_correct_item_correct"),
+    n_uncued_strong = sum(tmr_cued == "uncued"& pre_performance == "cat_correct_item_correct"),
+    n_cued_weak = sum(tmr_cued == "cued"& pre_performance == "cat_correct_item_incorrect"),
+    n_uncued_weak = sum(tmr_cued == "uncued"& pre_performance == "cat_correct_item_incorrect"),
+    n_cued_null = sum(tmr_cued == "cued"& pre_performance == "cat_incorrect"),
+    n_uncued_null = sum(tmr_cued == "uncued"& pre_performance == "cat_incorrect"),
+    p_cued_strong = (n_cued_strong/n_cued)*100,
+    p_uncued_strong = (n_uncued_strong/n_uncued)*100,
+    p_cued_weak = (n_cued_weak/n_cued)*100,
+    p_uncued_weak = (n_uncued_weak/n_uncued)*100,
+    p_cued_null = (n_cued_null/n_cued)*100,
+    p_uncued_null = (n_uncued_null/n_uncued)*100,
+    p_cued_control = p_cued_strong + p_cued_weak + p_cued_null,
+    p_uncued_control = p_uncued_strong + p_uncued_weak + p_uncued_null
+  )
+
+dat_design_summary <- dat_design %>% 
+  ungroup() %>% 
+  dplyr::summarise(across(where(is.numeric), list(mean = ~mean(.x, na.rm = TRUE),
+                                             sd   = ~sd(.x, na.rm = TRUE))))
+```
+
+
+# Summarize pre-sleep (baseline) performance
+```{r}
+#Overall performance (afc1-correct item)
+dat_singletrial %>% 
+  group_by(subID) %>% 
+  dplyr::summarise(mean_afc1 = mean(afc1_accuracy)) %>% 
+  ungroup() %>% 
+  dplyr::summarise(mean_afc1_group = mean(mean_afc1),
+                   sd_afc1_group = sd(mean_afc1))
+  
+  
+# Step 1: participant-level percentages, with zeros for empty cells
+dat_pre_perf <- dat_singletrial %>%
+  group_by(subID, pre_performance, tmr_cued) %>%
+  dplyr::summarise(n = n(), .groups = "drop") %>%
+  group_by(subID, pre_performance) %>%
+  dplyr::mutate(percentage = n / sum(n) * 100) %>%
+  ungroup() %>%
+  select(-n) %>%
+  # Complete missing combinations with zero
+  complete(subID, pre_performance, tmr_cued, fill = list(percentage = 0))
+
+
+# Step 2: group-level summary
+dat_pre_perf_group <- dat_pre_perf %>%
+  group_by(pre_performance, tmr_cued) %>%
+  dplyr::summarise(
+    mean_percentage = mean(percentage, na.rm = TRUE),
+    se              = sd(percentage, na.rm = TRUE) / sqrt(n()),
+    .groups         = "drop"
+  )
+
+
+# Step 3: plot
+ggplot() +
+  # Single participant dots
+  geom_point(
+    data    = dat_pre_perf,
+    aes(x = pre_performance, y = percentage, color = tmr_cued, group = tmr_cued),
+    alpha   = 0.2,
+    #color   = "gray50",
+    position = position_jitter(width = 0.05)
+  ) +
+  # Group mean lines
+  geom_line(
+    data = dat_pre_perf_group,
+    aes(x = pre_performance, y = mean_percentage, color = tmr_cued, group = tmr_cued)
+  ) +
+  # Group mean points
+  geom_point(
+    data = dat_pre_perf_group,
+    aes(x = pre_performance, y = mean_percentage, color = tmr_cued),
+    size = 3
+  ) +
+  # Error bars
+  geom_errorbar(
+    data = dat_pre_perf_group,
+    aes(x = pre_performance, y = mean_percentage, color = tmr_cued,
+        ymin = mean_percentage - 1.96 * se,
+        ymax = mean_percentage + 1.96 * se),
+    width = 0.1
+  ) +
+  scale_x_discrete(
+    labels = c(
+      "cat_correct_item_correct"   = "Cat+Item+",
+      "cat_correct_item_incorrect" = "Cat+Item-",
+      "cat_incorrect"              = "Cat-"
+    )
+  ) +
+  labs(
+    x = NULL,
+    y = "Percentage of trials (%)"
+  ) +
+  theme_classic()
+```
+
+# Visualize afc-perfromance over time in 3 pre-sleep categories
+```{r}
+# Step 1: participant-level percentages
+dat_raw <- dat_singletrial %>% 
+  #group_by(subID, tmr_cued, pre_performance) %>% 
+  group_by(subID, tmr_cued, pre_performance) %>% 
+
+  dplyr::summarise(n_items = n(),
+                   afc1 = mean(afc1_accuracy),
+                   afc2 = mean(afc2_accuracy),
+                   afc5 = mean(afc5_accuracy))%>%
+  ungroup() %>% 
+  pivot_longer(cols = starts_with("afc"), names_to = "time", values_to = "performance") %>% 
+  ungroup()
+
+tmp <- dat_raw %>% filter(time == "afc1")
+
+
+# Step 2: group-level summary
+dat_raw_group <- summarySEwithin(
+  data = dat_raw,
+  measurevar = "performance",
+  withinvars = c("time", "tmr_cued", "pre_performance"),
+  idvar = "subID",
+  na.rm = TRUE
+)
+
+dat_raw_group <- dat_raw %>% 
+  group_by(time, tmr_cued, pre_performance) %>% 
+  dplyr::summarise( n = n(),
+                    mean = mean(performance, na.rm=TRUE)
+                    )
+
+#Visualization
+dat_raw_group %>% 
+  ggplot(aes(x = time, y=mean, colour = tmr_cued, group = tmr_cued)) +
+  geom_point() +
+  geom_path() +
+  facet_wrap( ~pre_performance)
+```
+
+
+# RAW post-sleep performance values by pre-sleep category
+```{r}
+# Step 1: participant-level percentages
+dat_raw_postsleep <- dat_singletrial %>% 
+  #group_by(subID, tmr_cued, pre_performance) %>% 
+  group_by(subID, tmr_cued, pre_performance) %>% 
+
+  dplyr::summarise(n_items = n(),
+                   mean_afc2 = mean(afc2_accuracy),
+                   mean_afc5 = mean(afc5_accuracy),
+                   mean_retr = sum(retrieval_accuracy==1)/n())%>%
+  ungroup()
+
+
+# Step 2: group-level summary
+dat_raw_postsleep_group <- dat_raw_postsleep %>%
+  group_by(pre_performance, tmr_cued) %>%
+  dplyr::summarise(
+    mean_perc_afc2 = mean(mean_afc2, na.rm = TRUE),
+    se_afc2              = sd(mean_afc2, na.rm = TRUE) / sqrt(n()),
+    mean_perc_afc5 = mean(mean_afc5, na.rm = TRUE),
+    se_afc5              = sd(mean_retr, na.rm = TRUE) / sqrt(n()),
+    mean_perc_retr = mean(mean_retr, na.rm = TRUE),
+    se_retr              = sd(mean_retr, na.rm = TRUE) / sqrt(n()),
+    .groups         = "drop"
+  )
+
+
+```
+
+# Discard category incorrect items
+```{r}
+dat_singletrial <- dat_singletrial %>% 
+  filter(pre_performance != "cat_incorrect")  %>%
+  droplevels()
+```
+
+# Baseline corrected performance
+```{r}
+#Baseline-correction relative to item-specific 8AFC-1 performance
+dat_bl_avg <- dat_singletrial %>% 
+  ungroup() %>% 
+  group_by(subID, tmr_cued) %>% 
+  dplyr::summarise(n_afc1 = sum(afc1_accuracy ==1),
+            p_afc1 = sum(afc1_accuracy ==1)/n_afc1*100,
+            p_afc2 = sum(afc2_accuracy ==1)/n_afc1*100,
+            p_afc3 = sum(afc5_accuracy ==1)/n_afc1*100) %>% 
+  ungroup()
+
+
+dat_bl_avg_group <- dat_bl_avg %>% 
+  group_by(tmr_cued) %>% 
+  dplyr::summarise(mean_afc1 = mean(p_afc1, na.rm = TRUE),
+                   mean_afc2 = mean(p_afc2, na.rm = TRUE),
+                   mean_afc3 = mean(p_afc3, na.rm = TRUE))
+
+
+
+#Average values within each baseline category
+dat_bl_avg_preperf <- dat_singletrial %>% 
+  ungroup() %>% 
+  group_by(subID, tmr_cued, pre_performance) %>% 
+  dplyr::summarise(n_afc1 = sum(afc1_accuracy ==1),
+            p_afc1 = mean(afc1_accuracy),
+            p_afc2 = mean(afc2_accuracy),
+            p_afc3 = mean(afc5_accuracy)) %>% 
+  ungroup()
+
+
+dat_bl_avg_group_preperf <- dat_bl_avg_preperf %>% 
+  group_by(tmr_cued, pre_performance) %>% 
+  dplyr::summarise(mean_afc1 = mean(p_afc1, na.rm = TRUE),
+                   mean_afc2 = mean(p_afc2, na.rm = TRUE),
+                   mean_afc3 = mean(p_afc3, na.rm = TRUE))
+
+
+```
+
+# Single trial analysis
+```{r}
+#Select variables
+dat_singletrial_crop <- dat_singletrial %>% 
+  select(subID, itemID, encoding_vividness, tmr_cued,
+         afc2_accuracy, afc5_accuracy, 
+         pre_performance,
+         condition,
+         age_in_years, sex)
+
+
+#Data into long format
+dat_singletrial_crop_long <- dat_singletrial_crop %>%  pivot_longer(cols = starts_with("afc"), values_to = "p_success", names_to = "time")
+
+#Factorize time
+dat_singletrial_crop_long$time <- as.factor(dat_singletrial_crop_long$time)
+
+#Set contrasts
+contrasts(dat_singletrial_crop_long$tmr_cued) <- c(-0.5, 0.5)
+contrasts(dat_singletrial_crop_long$time) <- c(-0.5, 0.5)
+contrasts(dat_singletrial_crop_long$pre_performance) <- c(-0.5, 0.5)
+contrasts(dat_singletrial_crop_long$condition) <- c(-0.5, 0.5)
+contrasts(dat_singletrial_crop_long$sex) <- c(-0.5, 0.5)
+
+#Original model: main effects + time_interaction
+mod_orig <- glmer(p_success ~ encoding_vividness + time*tmr_cued + 
+                    pre_performance*tmr_cued +
+                    pre_performance*time +
+                    condition +
+                    age_in_years + sex +
+                    (1 | subID/itemID), 
+                  data = dat_singletrial_crop_long, 
+                  family = binomial, nAGQ = 0L)
+summary(mod_orig)
+
+
+mod_orig <- glmer(p_success ~ encoding_vividness + time + tmr_cued + pre_performance +
+                    pre_performance*tmr_cued +
+                    time*tmr_cued +
+                    pre_performance*time +
+                    condition +
+                    age_in_years + sex +
+                    (1 | subID/itemID), 
+                  data = dat_singletrial_crop_long, 
+                  family = binomial, nAGQ = 0L)
+
+
+
+
+#Vividness interactions
+mod_vivint <- glmer(p_success ~ time*encoding_vividness*tmr_cued +
+                      pre_performance*tmr_cued + 
+                      pre_performance*time +
+                      condition +
+                      age_in_years + sex +
+                      (1 | subID/itemID), 
+                    data = dat_singletrial_crop_long, 
+                    family = binomial, nAGQ = 0L)
+summary(mod_vivint)
+
+#Category interactions
+mod_categoryint <- glmer(p_success ~ time*tmr_cued*condition +
+                           pre_performance*tmr_cued + 
+                           pre_performance*time +
+                       encoding_vividness +
+                       age_in_years + sex +
+                       (1 | subID/itemID), 
+               data = dat_singletrial_crop_long, 
+              family = binomial, nAGQ = 0L)
+summary(mod_categoryint)
+
+
+#Model copmarisons
+cbind(
+  AIC(mod_orig, mod_vivint, mod_categoryint),
+  BIC(mod_orig, mod_vivint, mod_categoryint))[, c(1, 2, 4)] %>% 
+  mutate(
+    model = rownames(.)
+  )
+
+anova(mod_orig, mod_vivint)
+anova(mod_orig, mod_categoryint)
+
+```
+
+# Effect sizes of the selected model
+```{r}
+mod_select = mod_orig
+
+
+#Odd's ratios
+ors <- exp(cbind(OR = fixef(mod_select), confint(mod_select, parm = "beta_", method = "Wald")))
+
+#AMEs for continous variables
+ame_cont <- avg_slopes(mod_select, variables = c("encoding_vividness", "age_in_years"),
+           type = "response", re.form = NA)
+
+#AMEs for categorical variables
+ame_cat <- avg_comparisons(mod_select, 
+                           variables = c("tmr_cued", "time", "pre_performance", "condition", "sex"),
+                           type = "response", re.form = NA)
+
+#AMEs for significant interaction terms
+ame_int_tmr_preperf <- avg_comparisons(mod_select, 
+                           variables = c("tmr_cued"),
+                           by = "pre_performance",
+                           type = "response", re.form = NA)
+
+ame_int_time_preperf <- avg_comparisons(mod_select, 
+                           variables = c("time"),
+                           by = "pre_performance",
+                           type = "response", re.form = NA)
+
+#Random effects
+re <- as.data.frame(VarCorr(mod_select))
+re
+
+ngrps(mod_select)
+nobs(mod_select)
+```
+
+# Selected model into table
+```{r}
+## ---- 1. Edit these three blocks to match your model ------------------
+
+# Coefficient name (as in summary) -> label in the table
+labels <- c(
+  "(Intercept)"    = "Intercept",
+  "encoding_vividness"          = "vividness",
+  "time1"           = "test time",
+  "tmr_cued1"       = "TMR",
+  "pre_performance1"          = "pre-sleep baseline",
+  "condition1" = "category",
+  "age_in_years" = "age (years)",
+  "sex1" = "sex",
+  "time1:tmr_cued1"  = "TMR \u00d7 test time",
+  "tmr_cued1:preperf1" = "TMR \u00d7 pre-sleep baseline",
+  "time1:pre_performance1 " = "test time \u00d7 pre-sleep baseline"
+)
+
+# Coefficient name -> term name in ame_cont / ame_cat (main effects only)
+ame_map <- c(
+  "age_in_years"    = "age_in_years",
+  "encoding_vividness"     = "encoding_vividness",
+  "condition1" = "condition",
+  "pre_performance1"    = "pre_performance",
+  "sex1" = "sex",
+  "time1" = "time",
+  "tmr_cued1" = "tmr_cued") 
+
+# Significant interactions: coefficient name -> simple-effect AMEs and the
+# 'by' variable used to compute them
+int_map <- list(
+  "tmr_cued1:pre_performance1"  = list(ame = ame_int_tmr_preperf,  by = "pre_performance"),
+  "time1:pre_performance1" = list(ame = ame_int_time_preperf, by = "pre_performance")
+)
+
+out_file <- "table_mod_behavior.txt"
+
+## ---- 2. Helpers -----------------------------------------------------
+fmt    <- function(x, d = 2) formatC(x, format = "f", digits = d)
+fmt_ci <- function(lo, hi, d = 2) paste0("[", fmt(lo, d), ", ", fmt(hi, d), "]")
+fmt_p  <- function(p) ifelse(p < .001, "< .001",
+                             sub("^0", "", formatC(p, format = "f", digits = 3)))
+lab    <- function(nm) if (nm %in% names(labels)) labels[[nm]] else nm
+
+## ---- 3. Build the table ---------------------------------------------
+cf <- summary(mod_select)$coefficients
+
+cols <- c("term", "estimate", "conf.low", "conf.high")
+ame_main <- rbind(as.data.frame(ame_cont)[, cols],
+                  as.data.frame(ame_cat)[, cols])
+
+out <- paste("Predictor", "OR", "95% CI", "p", "AME (pp)", "95% CI", sep = "\t")
+
+for (nm in rownames(cf)) {
+  # main-effect AME, if this coefficient has one
+  a <- ame_main[ame_main$term %in% ame_map[nm], ]
+  ame_txt <- if (nrow(a) == 1) {
+    c(fmt(100 * a$estimate), fmt_ci(100 * a$conf.low, 100 * a$conf.high))
+  } else c("", "")
+
+  out <- c(out, paste(lab(nm),
+                      fmt(ors[nm, 1]), fmt_ci(ors[nm, 2], ors[nm, 3]),
+                      fmt_p(cf[nm, 4]),
+                      ame_txt[1], ame_txt[2], sep = "\t"))
+
+  # simple-effect AMEs under significant interactions
+  if (nm %in% names(int_map)) {
+    x   <- as.data.frame(int_map[[nm]]$ame)
+    byv <- int_map[[nm]]$by
+    for (i in seq_len(nrow(x))) {
+      out <- c(out, paste(
+        paste0("    ", x$term[i], " at ", byv, " = ", x[[byv]][i]),
+        "", "", "",
+        fmt(100 * x$estimate[i]),
+        fmt_ci(100 * x$conf.low[i], 100 * x$conf.high[i]), sep = "\t"))
+    }
+  }
+}
+
+## ---- 3b. Random effects ----------------------------------------------
+re_labels <- c("itemID:subID" = "Item within participant (intercept)",
+               "subID"        = "Participant (intercept)")
+
+re <- as.data.frame(VarCorr(mod_select))
+ng <- ngrps(mod_select)
+
+out <- c(out, "", "Random effects",
+         paste("Grouping factor", "Variance", "SD", "N groups", sep = "\t"))
+
+for (i in seq_len(nrow(re))) {
+  g <- re$grp[i]
+  out <- c(out, paste(if (g %in% names(re_labels)) re_labels[[g]] else g,
+                      fmt(re$vcov[i], 3), fmt(re$sdcor[i], 3),
+                      format(ng[[g]], big.mark = ","), sep = "\t"))
+}
+
+out <- c(out, paste("N observations",
+                    format(nobs(mod_select), big.mark = ","), sep = "\t"))
+
+## ---- 3c. Model fit ---------------------------------------------------
+var_fix  <- var(as.vector(getME(mod_select, "X") %*% fixef(mod_select)))
+var_rand <- sum(re$vcov)      # random-intercept variances from 3b
+var_res  <- pi^2 / 3          # residual variance, logit link
+tot      <- var_fix + var_rand + var_res
+
+out <- c(out, "", "Model fit",
+         paste("Marginal R\u00b2",    fmt(var_fix / tot, 3), sep = "\t"),
+         paste("Conditional R\u00b2", fmt((var_fix + var_rand) / tot, 3), sep = "\t"))
+
+## ---- 3d. Note --------------------------------------------------------
+outcome <- "memory item accuracy"   # wording for the outcome
+
+form <- gsub("\\s+", " ", paste(deparse(formula(mod_select), width.cutoff = 500L),
+                                collapse = ""))
+nagq <- if (!is.null(mod_select@call$nAGQ)) eval(mod_select@call$nAGQ) else 1
+est  <- if (nagq == 0) "nAGQ = 0" else if (nagq == 1) "Laplace approximation" else
+          paste0("adaptive Gauss-Hermite quadrature, nAGQ = ", nagq)
+
+note <- paste0(
+  "Note. Logistic generalized linear mixed model (binomial distribution, logit link) ",
+  "fitted by maximum likelihood with lme4 (", est, "). Model: ", form, ". ",
+  "Categorical predictors were contrast-coded (\u22120.5, 0.5). ",
+  "OR = odds ratio with Wald 95% confidence interval; p-values are from Wald z tests. ",
+  "For continuous predictors, ORs are per one-unit increase; for categorical predictors, ",
+  "ORs compare the two levels, averaged over the levels of the other factors; ",
+  "for interactions, ORs are ratios of odds ratios. ",
+  "AME = average marginal effect on the probability of ", outcome,
+  ", in percentage points, with delta-method 95% confidence intervals, computed with ",
+  "the marginaleffects package with random effects set to zero. ",
+  "For continuous predictors, AMEs are per one-unit increase; for categorical predictors, ",
+  "they are the difference between levels. AMEs for main effects are averaged over the ",
+  "observed values of all other predictors. For significant interactions, AMEs are given ",
+  "as simple effects, i.e. the effect of one factor at each level of the other (indented rows); ",
+  "no AMEs are given for non-significant interactions. ",
+  "Random-effect variances and SDs are on the logit scale. ",
+  "Marginal and conditional R\u00b2 (Nakagawa et al., 2017) give the proportion of ",
+  "latent-scale variance explained by the fixed effects alone and by the fixed and ",
+  "random effects together, using the logit residual variance \u03c0\u00b2/3."
+)
+
+## ---- 4. Write -------------------------------------------------------
+con <- file(out_file, open = "w", encoding = "UTF-8")
+writeLines(out, con)
+close(con)
+cat(out, sep = "\n")
+```
+
+
+
+# Visualization of the selected model
+```{r}
+# Get PabloPicasso palette
+pal <- paletteer_d("lisa::PabloPicasso_1")
+
+# ── Figure 1: Vividness main effect ──────────────────────────────────────────
+
+# Aggregate: per participant per vividness level
+vividness_subj <- dat_singletrial_crop_long %>%
+  filter(!is.na(encoding_vividness)) %>%
+  group_by(subID, encoding_vividness) %>%
+  dplyr::summarise(p_correct = mean(p_success, na.rm = TRUE), .groups = "drop")
+
+# Cell means + 95% CI
+vividness_means <- summarySEwithin(
+  data = vividness_subj,
+  measurevar = "p_correct",
+  withinvars = "encoding_vividness",
+  idvar = "subID",
+  na.rm = TRUE
+)
+
+fig1 <- ggplot(vividness_means, aes(x = factor(encoding_vividness), y = p_correct)) +
+  geom_jitter(data = vividness_subj, 
+              aes(x = factor(encoding_vividness), y = p_correct),
+              width = 0.1, alpha = 0.3, size = 1.5, color = "grey50") +
+  geom_errorbar(aes(ymin = p_correct - ci, ymax = p_correct + ci), 
+                width = 0.1, linewidth = 0.8) +
+  geom_point(size = 2) +
+  geom_line(aes(group = 1), linewidth = 0.8) +
+  scale_y_continuous(limits = c(0, 1), labels = scales::percent) +
+  labs(
+    x = "Encoding vividness",
+    y = "Proportion exemplar-correct (%)",
+    title = "Effect of encoding vividness"
+  ) +
+  theme_classic(base_size = 8)
+
+#fig1
+
+
+# ── Figure 2: TMR x time x pre_performance ───────────────────────────────────
+
+# Recode labels
+dat_plot <- dat_singletrial_crop_long %>%
+  mutate(
+    pre_perf_label = factor(pre_performance,
+                            levels = c("cat_correct_item_correct", "cat_correct_item_incorrect"),
+                            labels = c("Strong\n(exemplar correct)",
+                                       "Weak\n(exemplar incorrect)")),
+    time_label = factor(time,
+                        levels = c("afc2_accuracy", "afc5_accuracy"),
+                        labels = c("Item-test 2\n(~12 hours)", "Item-test 3\n(~5 days)")),
+    tmr_label = factor(tmr_cued, levels = c("cued", "uncued"), 
+                       labels = c("cued", "uncued"))
+  )
+
+# Aggregate: per participant per cell
+tmr_subj <- dat_plot %>%
+  group_by(subID, tmr_label, time_label, pre_perf_label) %>%
+  dplyr::summarise(p_correct = mean(p_success, na.rm = TRUE), .groups = "drop")
+
+# Cell means + 95% CI
+tmr_means <- summarySEwithin(
+  data = tmr_subj,
+  measurevar = "p_correct",
+  withinvars = c("tmr_label", "time_label", "pre_perf_label"),
+  idvar = "subID",
+  na.rm = TRUE
+)
+
+#tmr_means <- tmr_subj %>% 
+#  group_by(tmr_label, time_label, pre_perf_label) %>% 
+#  dplyr::summarise(n_subj = n(),
+#                   performance = mean(p_correct, na.rm=TRUE),
+#                   sd_perf = sd(p_correct, na.rm=TRUE),
+#                   ci = 1.96 * (sd_perf/sqrt(n_subj))
+#                   )
+
+
+lab <- data.frame(
+  pre_perf_label  = "Strong\n(exemplar correct)",  # must match the facet level exactly
+  y     = c(1/4, 1/8),
+  label = c("conditional chance", "absolute chance")
+)
+
+fig2 <- ggplot(tmr_means, aes(x = time_label, y = p_correct, 
+                               color = tmr_label, group = tmr_label)) +
+  geom_jitter(data = tmr_subj,
+            aes(y = p_correct),
+            alpha = 0.25, size = 1.2, color = "grey50",
+            position = position_jitterdodge(jitter.width = 0.1, dodge.width = 0.4)) +
+  geom_errorbar(aes(ymin = p_correct - ci, ymax = p_correct + ci),
+                width = 0.1, linewidth = 0.8,
+                position = position_dodge(width = 0.4)) +
+  geom_point(size = 2, position = position_dodge(width = 0.4)) +
+  geom_line(position = position_dodge(width = 0.4), linewidth = 0.8) +
+  scale_color_manual(values = setNames(pal, c("cued", "uncued"))) +
+  scale_y_continuous(limits = c(0, 1), labels = scales::percent) +
+  facet_grid(~ pre_perf_label) +
+  labs(
+    x = "Time point",
+    y = "Proportion exemplar-correct (%)",
+    color = "TMR",
+    title = "TMR effect by pre-sleep performance"
+  ) +
+  geom_hline(yintercept = 1/4, linetype = "dashed") +
+  geom_hline(yintercept = 1/8, linetype = "dashed") +
+  geom_text(data = lab, aes(x = -Inf, y = y, label = label),
+            hjust = -0.05, vjust = -0.6, inherit.aes = FALSE) +
+  #annotate("text", x = Inf, y = 1/4, label = "conditional chance",
+  #         hjust = 1.05, vjust = -0.6, size = 3) +
+  #annotate("text", x = Inf, y = 1/8, label = "absolute chance",
+  #         hjust = 1.05, vjust = -0.6, size = 3) +
+  theme_classic(base_size = 8) +
+  theme(
+    strip.background = element_blank(),
+    strip.text = element_text(face = "bold"),
+    legend.position = "bottom"
+  )
+
+#fig2
+
+fig_behav <- ggarrange(fig2, fig1, nrow = 1, ncol = 2)
+fig_behav
+
+ggsave(filename = "fig_behavior.pdf", 
+       path = figpath,
+       plot = fig_behav, 
+       width = 15, 
+       height = 10, 
+       units = "cm")
+
+```
+
